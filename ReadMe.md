@@ -29,9 +29,7 @@ it a complete attack tool. The curios user should look into the mknod
 commands, and perhaps explore creating device files on different OS's, 
 with different NFS configurations. Maybe kmem could be useful?
 
-The current implementation has mainly been tested towards the
-NFS server on OpenBSD 7.4, and the source code has been built
-on Ubuntu 22.04.2 LTS and FreeBSD 13.1 (amd64).
+The source code has been built on Ubuntu 22.04.2 LTS and FreeBSD 13.1 (amd64).
 
 ## NFS v3 CLI v1.5, by Claes M Nyberg <cmn@signedness.org>, Aug 2023
 ```
