@@ -22,6 +22,7 @@ NFS server on OpenBSD 7.4, and the source code has been built
 on Ubuntu 22.04.2 LTS and FreeBSD 13.1 (amd64).
 
 ## NFS v3 CLI v1.5, by Claes M Nyberg <cmn@signedness.org>, Aug 2023
+```
 Available commands:
 cat .......................... (NFS v3 READ) Read file and write to terminal
 create ....................... (NFS v3 CREATE) Create a file inside directory represented by file handle
@@ -59,4 +60,4 @@ uid .......................... Set UID to use in calls
 umntall ...................... (Mount v3 UMNTALL) Removes all of the mount entries for this client at server
 verbose ...................... Set level of verboseness
 write ........................ (NFS v3 WRITE) Write to file
-
+```
