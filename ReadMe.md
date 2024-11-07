@@ -19,6 +19,9 @@ to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
 when visiting systems for example in a red-team operation.
 
+A part from the NFSv3 specific implementations, it also support spoofing
+your src IPv4, to simplify access to those exports limited to certain hosts.
+
 This implementation allow for regular file transfers in both directions,
 as well as hexdump/patch at certain offset in given files, which makes
 it a complete attack tool. The curios reader should look into the mknod
