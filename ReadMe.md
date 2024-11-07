@@ -26,7 +26,7 @@ This implementation allow for regular file transfers in both directions,
 as well as hexdump/patch at certain offset in given files, which makes
 it a complete attack tool. The curios user should look into the mknod
 commands, and perhaps explore creating device files on different OS's, 
-with different NFS configurations, maybe kmem could be useful?
+with different NFS configurations. Maybe kmem could be useful?
 
 The current implementation has mainly been tested towards the
 NFS server on OpenBSD 7.4, and the source code has been built
