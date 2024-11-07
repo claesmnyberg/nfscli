@@ -12,7 +12,7 @@
 This is an almost complete implementation of the NFS v3 protocol as
 a stand alone binary with an ftp-alike commandline interface that uses
 file handles rather than path's.
-The few commands not yet implemented serves no purpose in this implementation.
+The few commands not yet implemented serve no purpose in this implementation.
 See the ReadMe.txt inside the src directory for more information.
 
 The purpose was to create a tool that easily can be moved around
