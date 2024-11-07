@@ -11,11 +11,19 @@
 
 This is an almost complete implementation of the NFS v3 protocol as
 a stand alone binary with an ftp-alike commandline interface.
+The few commands not yet implemented serves no purpose in this implementation.
+See the ReadMe.txt inside the src directory for more information.
 
 The purpose was to create a tool that easily can be moved around
 to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
 when visiting systems for example in a red-team operation.
+
+This implementation allow for regular file transfers in both directions,
+as well as hexdump/patch at certain offset in given files, which makes
+it a complete attack tool. The curios reader should look into the mknod
+commands, and perhaps explore creating device files on different OS's, 
+with different NFS configurations, maybe kmem could be useful?
 
 The current implementation has mainly been tested towards the
 NFS server on OpenBSD 7.4, and the source code has been built
