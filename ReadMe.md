@@ -24,7 +24,7 @@ your src IPv4, to simplify access to those exports limited to certain hosts.
 
 This implementation allow for regular file transfers in both directions,
 as well as hexdump/patch at certain offset in given files, which makes
-it a complete attack tool. The curios reader should look into the mknod
+it a complete attack tool. The curios user should look into the mknod
 commands, and perhaps explore creating device files on different OS's, 
 with different NFS configurations, maybe kmem could be useful?
 
