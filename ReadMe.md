@@ -3,7 +3,7 @@
 
 ---
 
-<img src="https://github.com/claesmnyberg/nfscli/blob/main/nfscli.gif" width="50%" height="50%"/>
+<img src="https://github.com/claesmnyberg/nfscli/blob/main/nfscli.gif" width="80%" height="80%"/>
 
 ---
 
