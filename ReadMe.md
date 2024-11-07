@@ -15,7 +15,7 @@ a stand alone binary with an ftp-alike commandline interface.
 The purpose was to create a tool that easily can be moved around
 to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
-when visiting systems.
+when visiting systems for example in a red-team operation.
 
 The current implementation has mainly been tested towards the
 NFS server on OpenBSD 7.4, and the source code has been built
