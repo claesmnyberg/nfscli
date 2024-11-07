@@ -1,4 +1,13 @@
-![](https://github.com/claesmnyberg/nfscli/nfscli.gif)
+# nfscli
+## ©️ 2023-2024 Claes M Nyberg, cmn@signedness.org
+
+---
+
+<img src="https://github.com/claesmnyberg/nfscli/blob/main/nfscli.gif" width="50%" height="50%"/>
+
+---
+
+## What is this?
 
 This is an almost complete implementation of the NFS v3 protocol as
 a stand alone binary with an ftp-alike commandline interface.
@@ -12,7 +21,7 @@ The current implementation has mainly been tested towards the
 NFS server on OpenBSD 7.4, and the source code has been built
 on Ubuntu 22.04.2 LTS and FreeBSD 13.1 (amd64).
 
-NFS v3 CLI v1.5, by Claes M Nyberg <cmn@signedness.org>, Aug 2023
+## NFS v3 CLI v1.5, by Claes M Nyberg <cmn@signedness.org>, Aug 2023
 Available commands:
 cat .......................... (NFS v3 READ) Read file and write to terminal
 create ....................... (NFS v3 CREATE) Create a file inside directory represented by file handle
