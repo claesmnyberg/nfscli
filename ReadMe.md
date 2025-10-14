@@ -19,6 +19,9 @@ This tool was developed as part of the research presented at 44Con 2024
 and you can watch the full video here: 
 https://www.youtube.com/watch?v=NuxCUMIH5M8
 
+If you find this useful, you probably want to check out brutefh as well:
+https://github.com/claesmnyberg/brutefh
+
 The purpose was to create a tool that easily can be moved around
 to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
