@@ -15,12 +15,14 @@ file handles rather than path's.
 The few commands not yet implemented serve no purpose in this implementation.
 See the ReadMe.txt inside the src directory for more information.
 
+This tool was developed as part of the research presented at 44Con 2024
+and you can watch the full video here: 
+https://www.youtube.com/watch?v=NuxCUMIH5M8
+
 The purpose was to create a tool that easily can be moved around
 to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
 when visiting systems for example in a red-team operation.
-The tool was developed as part of the research presented at 44Con 2024
-and you can watch it here: https://www.youtube.com/watch?v=NuxCUMIH5M8
 
 A part from the NFSv3 specific implementations, it also support spoofing
 your src IPv4, to simplify access to those exports limited to certain hosts.
