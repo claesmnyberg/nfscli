@@ -19,6 +19,8 @@ The purpose was to create a tool that easily can be moved around
 to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
 when visiting systems for example in a red-team operation.
+The tool was developed as part of the research presented at 44Con 2024
+and you can watch it here: https://www.youtube.com/watch?v=NuxCUMIH5M8
 
 A part from the NFSv3 specific implementations, it also support spoofing
 your src IPv4, to simplify access to those exports limited to certain hosts.
