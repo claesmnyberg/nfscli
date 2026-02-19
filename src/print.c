@@ -1,6 +1,6 @@
-
 /*
- * Copyright (C)  2023-2024 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2023-2026 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2025-2026 John Cartwright <johnc@grok.org.uk>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -13,9 +13,10 @@
  *    documentation and/or other materials provided with the distribution.
  * 3. All advertising materials mentioning features or use of this software
  *    must display the following acknowledgement:
- *      This product includes software developed by Claes M Nyberg.
- * 4. The name Claes M Nyberg may not be used to endorse or promote
- *    products derived from this software without specific prior written
+ *      This product includes software developed by Claes M Nyberg and
+ *      John Cartwright.
+ * 4. The names Claes M Nyberg and John Cartwright may not be used to endorse
+ *    or promote products derived from this software without specific prior written
  *    permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY
@@ -31,15 +32,25 @@
  * SUCH DAMAGE.
  */
 
-#include <stdio.h>
+/*
+ * print.c - Verbose output utilities
+ *
+ * Provides level-controlled output (info, detail, debug, trace).
+ * Output is suppressed based on verbosity level in ctx->verbose.
+ */
+
 #include <stdarg.h>
+#include <time.h>
+
 #include "nfscli.h"
+#include "print.h"
+#include "str.h"
 
 /*
  * Only print if verbose level is high enough
  */
 void
-print(unsigned int level, struct nfsctx *ctx, char *fmt, ...)
+print(unsigned int level, struct nfsctx *ctx, const char *fmt, ...)
 {
     va_list ap;
     char ts[128];
@@ -47,8 +58,9 @@ print(unsigned int level, struct nfsctx *ctx, char *fmt, ...)
     if (ctx->verbose < level)
         return;
 
-    str_timestamp(ts, sizeof(ts)-1);
-    printf("[%s] %s: ", ts, ctx->server);
+    if (str_time(ts, sizeof(ts) - 1, time(NULL)) == NULL)
+        snprintf(ts, sizeof(ts), "?");
+    printf("[%s] %s: ", ts, ctx->server.name);
     va_start(ap, fmt);
     vfprintf(stdout, fmt, ap);
     va_end(ap);

@@ -1,6 +1,6 @@
-
 /*
- * Copyright (C)  2023-2024 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2023-2026 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2025-2026 John Cartwright <johnc@grok.org.uk>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -13,9 +13,10 @@
  *    documentation and/or other materials provided with the distribution.
  * 3. All advertising materials mentioning features or use of this software
  *    must display the following acknowledgement:
- *      This product includes software developed by Claes M Nyberg.
- * 4. The name Claes M Nyberg may not be used to endorse or promote
- *    products derived from this software without specific prior written
+ *      This product includes software developed by Claes M Nyberg and
+ *      John Cartwright.
+ * 4. The names Claes M Nyberg and John Cartwright may not be used to endorse
+ *    or promote products derived from this software without specific prior written
  *    permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY
@@ -30,96 +31,143 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+
+/*
+ * nfs.h - Unified NFS API
+ *
+ * This header provides a single, version-independent API for NFS operations.
+ * Functions automatically dispatch to the correct version (v2 or v3) based
+ * on ctx->nfs_version.
+ *
+ * All functions use struct nfs_fh for file handles, which works for both
+ * v2 (fixed 32-byte) and v3 (variable-length up to 64 bytes).
+ */
+
 #ifndef NFS_H
 #define NFS_H
 
+#include "nfs_types.h"
 #include <stdint.h>
 
-#include "nfsh.h"
+struct nfsctx;
 
-struct rpc_call {
-    uint32_t xid;
-    uint32_t msgtype;
-    #define RPC_MSG_TYPE_CALL   0
-    #define RPC_MSG_TYPE_REPLY  1
+/*
+ * Unified NFS operations
+ * These dispatch to v2 or v3 based on ctx->nfs_version
+ */
 
-    uint32_t version;
-    uint32_t program;
-    #define RPC_PROGRAM_PORTMAP 100000
-    #define RPC_PROGRAM_NFS     100003
-    #define RPC_PROGRAM_MOUNT   100005
+/* Get file attributes */
+int nfs_getattr(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_attr *out);
 
-    uint32_t program_version;
-    uint32_t procedure;
-    #define RPC_NFS_PROCEDURE_LOOKUP        3
-    #define RPC_NFS_PROCEDURE_READ          6
-    #define RPC_NFS_PROCEDURE_MKDIR         9
-    #define RPC_NFS_PROCEDURE_LINK          15
-    #define RPC_NFS_PROCEDURE_READDIRPLUS   17
-    #define RPC_PORTMAP_PROCEDURE_GETPORT   3
-    #define RPC_MOUNT_PROCEDURE_MNT         1
-    #define RPC_MOUNT_PROCEDURE_EXPORT      5
+/* Set file attributes */
+int nfs_setattr(struct nfsctx *ctx, const struct nfs_fh *fh,
+    const struct nfs_sattr *sattr);
 
-} __attribute__((packed));
+/* Lookup a name in a directory */
+int nfs_lookup(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, struct nfs_lookup_res *out);
 
-struct rpc_reply {
-    uint32_t xid;
-    uint32_t msgtype;
-    uint32_t reply_state;
-        #define RPC_ACCEPTED 0
-} __attribute__((packed));
+/* Read symbolic link target */
+int nfs_readlink(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_readlink_res *out);
 
+/* Read from a file */
+int nfs_read(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, uint32_t count, struct nfs_read_res *out);
 
-#define NFS3_OK 0
-#define RPC_EXEC_SUCCESS 0
+/* Write to a file (out may be NULL if result not needed) */
+int nfs_write(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, const uint8_t *data, uint32_t count,
+    struct nfs_write_res *out);
 
-struct rpc_creds {
-    uint32_t flavor;
-    #define FLAVOR_AUTH_UNIX    1
-    uint32_t length;
-};
+/* Create a regular file (create_mode: NFS_CREATE_UNCHECKED/GUARDED/EXCLUSIVE) */
+int nfs_create(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, uint32_t mode, int create_mode,
+    struct nfs_create_res *out);
 
-struct rpc_verifier {
-    uint32_t flavor;
-    uint32_t length;
-};
+/* Remove a file */
+int nfs_remove(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name);
 
-#define RPC_CHECK_REPLY(_r)                                                                 \
-{                                                                                       \
-    if (ntohl((_r)->r.xid) != xid) {                                                    \
-        fprintf(stderr, "** Warning: Recevied bad XID, got %08x, expected %08x\n",      \
-            (_r)->r.xid, htonl(xid));                                                   \
-        return -1;                                                                      \
-    }                                                                                   \
-                                                                                        \
-    if (ntohl((_r)->r.msgtype) != RPC_MSG_TYPE_REPLY) {                                 \
-        fprintf(stderr, "** Warning: Did not receive Reply response, ignoring\n");      \
-        return -1;                                                                      \
-    }                                                                                   \
-                                                                                        \
-    if (ntohl((_r)->r.reply_state) != RPC_ACCEPTED) {                                   \
-        fprintf(stderr, "** Error: RPC reply state not accepted\n");                    \
-        return -1;                                                                      \
-    }                                                                                   \
-                                                                                        \
-    if (ntohl((_r)->accept_state) != RPC_EXEC_SUCCESS) {                                \
-        fprintf(stderr, "** Error: RPC exec failed\n");                                 \
-        return -1;                                                                      \
-    }                                                                                   \
-                                                                                        \
-    if (ntohl((_r)->status) != NFS3_OK) {                                               \
-        fprintf(stderr, "** Error: Receive status not NFS3_OK\n");                      \
-        return -1;                                                                      \
-    }                                                                                   \
-}
+/* Rename a file */
+int nfs_rename(struct nfsctx *ctx, const struct nfs_fh *srcfh,
+    const char *srcname, const struct nfs_fh *dstfh, const char *dstname);
 
+/* Create a hard link */
+int nfs_link(struct nfsctx *ctx, const struct nfs_fh *fh,
+    const struct nfs_fh *dirfh, const char *name);
 
-/* rpc.c */
+/* Create a symbolic link */
+int nfs_symlink(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, const char *target, uint32_t mode);
 
-/* portmap.c */
-extern int portmap_getport(struct nfsctx *, uint32_t);
-#define portmap_getport_nfsd(__ctx)	portmap_getport((__ctx), RPC_PROGRAM_NFS)
-#define portmap_getport_mountd(__ctx)	portmap_getport((__ctx), RPC_PROGRAM_MOUNT)
+/* Create a directory */
+int nfs_mkdir(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, uint32_t mode, struct nfs_create_res *out);
 
+/* Remove a directory */
+int nfs_rmdir(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name);
+
+/* Read directory entries */
+int nfs_readdir(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_dir *out);
+
+/*
+ * Read directory entries with attributes (v3: readdirplus, v2: emulated)
+ * Flags:
+ *   NFS_READDIRPLUS_FULL (0) - Get full data (FH, attrs) - default
+ *   NFS_READDIRPLUS_NAMES - Names only (skip LOOKUPs in v2 emulation)
+ */
+#define NFS_READDIRPLUS_FULL  0
+#define NFS_READDIRPLUS_NAMES 1
+
+int nfs_readdirplus(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_dir *out, int flags);
+
+/* Create a device node (v3 only, returns ENOTSUP for v2) */
+int nfs_mknod(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, int type, uint32_t mode,
+    uint32_t major, uint32_t minor, struct nfs_create_res *out);
+
+/* Get filesystem statistics (v2: STATFS, v3: FSSTAT) */
+int nfs_statfs(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_fsstat_res *out);
+
+/* Get filesystem info (v3 only, returns ENOTSUP for v2) */
+int nfs_fsinfo(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_fsinfo_res *out);
+
+/* Check access permissions (v3 only, returns ENOTSUP for v2) */
+int nfs_access(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint32_t access_mask, struct nfs_access_res *out);
+
+/* Get path configuration (v3 only, returns ENOTSUP for v2) */
+int nfs_pathconf(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_pathconf_res *out);
+
+/* NFS connectivity test (NULL procedure) */
+int nfs_null(struct nfsctx *ctx);
+
+/* Commit cached writes to stable storage (NFSv3 only, returns ENOTSUP for v2) */
+int nfs_commit(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, uint32_t count, struct nfs_commit_res *out);
+
+/* Write to a file with explicit stability mode (NFSv3: configurable, v2: FILE_SYNC) */
+int nfs_write_stable(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, const uint8_t *data, uint32_t count,
+    int stability, struct nfs_write_res *out);
+
+/*
+ * Version selection helpers
+ */
+int set_nfs_version(struct nfsctx *ctx, uint8_t version);
+int set_highest_nfs_version(struct nfsctx *ctx);
+void init_nfs_version(struct nfsctx *ctx);
+void update_nfs_ops(struct nfsctx *ctx);
+
+/* Check if NFS service is available (probes if needed, returns 1=yes, 0=no) */
+int nfs_service_available(struct nfsctx *ctx);
 
 #endif /* NFS_H */

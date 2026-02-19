@@ -1,0 +1,17 @@
+AlignAfterOpenBracket: false
+AlignConsecutiveMacros:
+  Enabled: true
+AlignOperands: false
+AlignTrailingComments:
+  Kind: Always
+  OverEmptyLines: 3
+BinPackArguments: true
+BreakAfterReturnType: AllDefinitions
+BreakBeforeBinaryOperators: None
+BreakBeforeBraces: Linux
+ColumnLimit: 0
+ContinuationIndentWidth: 4
+IndentWidth: 4
+SpacesBeforeTrailingComments: 4
+TabWidth: 4
+UseTab: Never

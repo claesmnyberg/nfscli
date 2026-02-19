@@ -1,18 +1,16 @@
 # nfscli
-## ©️ 2023-2024 Claes M Nyberg, cmn@signedness.org
+## ©️ 2023-2026 Claes M Nyberg <cmn@signedness.org>
+## ©️ 2025-2026 John Cartwright <johnc@grok.org.uk>
 
 ---
-
-<img src="https://github.com/claesmnyberg/nfscli/blob/main/nfscli.gif" width="100%" height="100%"/>
+<img src="nfscli.gif" width="100%" height="100%"/>
 
 ---
 
 ## What is this?
 
-This is an almost complete implementation of the NFS v3 protocol as
-a stand alone binary with an ftp-alike commandline interface that uses
-file handles rather than path's.
-The few commands not yet implemented serve no purpose in this implementation.
+This is an almost complete implementation of the NFS v2/v3 protocols as
+a stand alone binary with an ftp-alike commandline interface.
 See the ReadMe.txt inside the src directory for more information.
 
 This tool was developed as part of the research presented at 44Con 2024
@@ -27,54 +25,64 @@ to different systems with minimal impact on the system itself in regards
 to configuration files and installed packages, which is crucial
 when visiting systems for example in a red-team operation.
 
-A part from the NFSv3 specific implementations, it also support spoofing
+Apart from the NFS specific implementations, it also support spoofing
 your src IPv4, to simplify access to those exports limited to certain hosts.
 
 This implementation allow for regular file transfers in both directions,
 as well as hexdump/patch at certain offset in given files, which makes
-it a complete attack tool. The curios user should look into the mknod
-commands, and perhaps explore creating device files on different OS's, 
+it a complete attack tool. The curious user should look into the mknod
+command, and perhaps explore creating device files on different OS's,
 with different NFS configurations. Maybe kmem could be useful?
 
 The source code has been built on Ubuntu 22.04.2 LTS and FreeBSD 13.1 (amd64).
 
-## NFS v3 CLI v1.5, by Claes M Nyberg <cmn@signedness.org>, Aug 2023
 ```
 Available commands:
-cat .......................... (NFS v3 READ) Read file and write to terminal
-create ....................... (NFS v3 CREATE) Create a file inside directory represented by file handle
-dump ......................... (Mount v3 DUMP) List file systems mounted by all clients
+!<command> ................... Execute (local) shell command
+access ....................... (NFS v3 ACCESS) Check access permissions
+browse ....................... Browse remote filesystem
+cache ........................ Control directory cache
+cat .......................... (NFS READ) Read file and write to terminal
+commit ....................... (NFS v3 COMMIT) Commit cached writes to stable storage
+create ....................... (NFS CREATE) Create regular file in directory
+df ........................... (NFS STATFS/FSSTAT) Get filesystem statistics
+dump ......................... (Mount DUMP) List file systems mounted by all clients
 explore ...................... Explore remote NFS server
-exports ...................... (Mount v3 EXPORT) Show the NFS server's export list
-get .......................... (NFS v3 READ) Download file
-getattr ...................... (NFS v3 GETATTR) Get attributes for file handle
-getfh ........................ (Mount v3 MNT + UMNTALL) Get fh for exported directory and unregister this client
-getoff ....................... (NFS v3 READ) Download file from offset to local file
-getport ...................... (Portmap v2 GETPORT) Query portmap service for port number
-gid .......................... Set GID to use in calls
-help ......................... Display help for all or specific command
-link ......................... (NFS v3 LINK) Link the file represented by fh to a file inside the directory represented by dir-fh
-lookup ....................... (NFS v3 LOOKUP) Lookup file handle for filename in directory represented by file handle
-ls ........................... Alias for readdirplus
-mkdir ........................ (NFS v3 MKDIR) Create a directory inside directory represented by file handle
-mknod-blk .................... (NFS v3 MKNOD) Create block device file in directory represented by fh
-mknod-chr .................... (NFS v3 MKNOD) Create character device file in directory represented by fh
-mnt .......................... (Mount v3 MNT) Get file handle for mount of exported path
-put .......................... (NFS v3 CREATE + WRITE) Upload file to directory represented by file handle
-putoff ....................... (NFS v3 WRITE) Resume upload from offset in local file to remote file represented by fh
+exports ...................... (Mount EXPORT) Show the NFS server's export list
+fsinfo ....................... (NFS v3 FSINFO) Get filesystem information
+get .......................... (NFS READ) Download file
+getattr ...................... (NFS GETATTR) Get attributes for file or directory
+getfh ........................ (Mount MNT + UMNTALL) Get fh for exported directory and unregister this client
+getoff ....................... (NFS READ) Download file from offset to local file
+getport ...................... (Portmap v2 GETPORT/v3 GETADDR) Query portmap service for port number
+gid .......................... Show or set GID to use in calls
+help ......................... Show command help
+link ......................... (NFS LINK) Create hard link to file
+lookup ....................... (NFS LOOKUP) Lookup name in directory
+ls ........................... List directory contents (alias for readdirplus)
+mkdir ........................ (NFS MKDIR) Create directory
+mknod ........................ (NFS v3 MKNOD) Create device or special file
+mnt .......................... (Mount MNT) Get file handle for mount of exported path
+pathconf ..................... (NFS v3 PATHCONF) Get POSIX path configuration
+ping ......................... (RPC NULL) Test connectivity to RPC service
+protocol ..................... Display or set protocol version
+put .......................... (NFS CREATE + WRITE) Upload file to directory represented by file handle
+putoff ....................... (NFS WRITE) Resume file upload from offset
 quit ......................... Quit
-read ......................... (NFS v3 READ) Read from file
-readdir ...................... (NFS v3 READDIR) Read directory contents
+read ......................... (NFS READ) Read from file
+readdir ...................... (NFS READDIR) Read directory contents
 readdirplus .................. (NFS v3 READDIRPLUS) Read directory contents
-readlink ..................... (NFS v3 READLINK) Read data from symbolic link represented by fh
-remove ....................... (NFS v3 REMOVE) Remove a file inside directory represented by file handle
-rename ....................... (NFS v3 RENAME) Rename a file in directory represented by src-fh, to dst-name inside directory dst-fh
-rmdir ........................ (NFS v3 RMDIR) Remove directory inside directory represented by file handle
-setattr ...................... (NFS v3 SETATTR) Set mode on file represented by file handle
+readlink ..................... (NFS READLINK) Read target of symbolic link
+remove ....................... (NFS REMOVE) Remove file from directory
+rename ....................... (NFS RENAME) Rename file or directory from src-dirfh/src-name to dst-dirfh/dst-name
+rmdir ........................ (NFS RMDIR) Remove directory
+rpcinfo ...................... (Portmap DUMP) List registered RPC services
+setattr ...................... (NFS SETATTR) Set attributes for file or directory
 settings ..................... Display current settings
-symlink ...................... (NFS v3 SYMLINK) Create symbolic link in directory represented by fh
-uid .......................... Set UID to use in calls
-umntall ...................... (Mount v3 UMNTALL) Removes all of the mount entries for this client at server
-verbose ...................... Set level of verboseness
-write ........................ (NFS v3 WRITE) Write to file
+symlink ...................... (NFS SYMLINK) Create symbolic link
+uid .......................... Show or set UID to use in calls
+umnt ......................... (Mount UMNT) Unmount a specific export path
+umntall ...................... (Mount UMNTALL) Removes all of the mount entries for this client at server
+verbose ...................... Show or set verbosity level
+write ........................ (NFS WRITE) Write to file
 ```

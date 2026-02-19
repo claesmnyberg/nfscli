@@ -1,6 +1,6 @@
-
 /*
- * Copyright (C) 2023 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2023-2026 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2025-2026 John Cartwright <johnc@grok.org.uk>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -13,10 +13,11 @@
  *    documentation and/or other materials provided with the distribution.
  * 3. All advertising materials mentioning features or use of this software
  *    must display the following acknowledgement:
- *      This product includes software developed by Claes M Nyberg.
- * 4. The name Claes M Nyberg may not be used to endorse or promote
- *    products derived from this software without specific prior written
- *    permission.
+ *      This product includes software developed by Claes M Nyberg and
+ *      John Cartwright.
+ * 4. The names Claes M Nyberg and John Cartwright may not be used to endorse
+ *    or promote products derived from this software without specific prior
+ *    written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY
  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE

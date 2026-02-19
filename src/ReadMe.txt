@@ -1,38 +1,144 @@
-Copyright Claes M. Nyberg <cmn@signedness.org>, 2023-2024
+Copyright Claes M. Nyberg <cmn@signedness.org>, 2023-2026
+Copyright John Cartwright <johnc@grok.org.uk>, 2025-2026
 
 -=[ What is this?
-This is an almost complete implementation of the NFS v3 protocol as
-a stand alone binary with an ftp-alike commandline interface.
+This is an almost complete implementation of the NFS v2/v3 protocols
+as a stand alone binary with an ftp-alike commandline interface.
 
-The purpose was to create a tool that easily can be moved around 
-to different systems with minimal impact on the system itself in regards
-to configuration files and installed packages, which is crucial
-when visiting systems.
+The purpose was to create a tool that easily can be moved around
+to different systems with minimal impact on the system itself in
+regards to configuration files and installed packages, which is
+crucial when visiting systems.
 
 The current implementation has mainly been tested towards the
 NFS server on OpenBSD 7.4, and the source code has been built
 on Ubuntu 22.04.2 LTS and FreeBSD 13.1 (amd64).
 
 -=[ Limitations
-Currently, only UDP is supported and the implementation lacks the
-following NFS v3 commands:
-	FSSTAT
-	FSINFO
-	PATHCONF
-	COMMIT (not needed since we commit for each write)
-
-Buffer sizes has been fixed in an attempt to keep data in single UDP 
-packets with an MTU of 1500 and some optional parameters has been
-ignored. For example, WRITE uses FILE_SYNC that forces data to be
-synchronized with storage before the server returns, making it 
-slower but more reliable than first using UNSTABLE for a large number 
-of writes and then finish with a COMMIT.
+Currently, only UDP is supported.  Buffer sizes have been fixed in an 
+attempt to keep data in single UDP packets with an MTU of 1500.
 
 -=[ TODO
 	- Add download directory for explore command to store shadow file 
 	  and SSH keys
 
 -=[ Changelog
+1.8
+	--( Architecture
+	Added lightweight path resolution layer (pathctx) for path-based
+	operations throughout the codebase.
+
+	--( Performance
+	Caching subsystem with O(1) hash-based directory lookups,
+	attribute cache with configurable TTL, and file handle cache
+	for name resolution.
+
+	--( Network
+	Overhauled portmap code for better version detection and to handle
+	buggy portmappers that return ports for unregistered versions.
+
+	--( IP Spoofing
+	Major performance improvement for raw socket mode (-S/--spoof-ip).
+	Spoofed RPC calls now execute at near-native UDP speed.
+	Added BPF kernel filtering and gratuitous ARP on startup.
+
+	--( CLI
+	Tab completion for file handles (queries cached entries).
+	Tab completion for NFS paths and filenames.
+	Tab completion for help topics, now greatly expanded.
+
+	--( Command: access
+	New command (NFS v3 ACCESS) for checking file/directory permissions.
+
+	--( Command: browse
+	New interactive filesystem browser with path-based navigation.
+	Eliminates the need to work with file handles for common operations.
+	Auto-uid mode reads passwd/group files to automatically switch
+	credentials for reading files owned by non-root users.
+
+	--( Command: cache
+	New cache control command added.
+
+	--( Command: df
+	New command for filesystem statistics (STATFS v2, FSSTAT v3).
+
+	--( Command: fsinfo
+	New command for filesystem information (NFS v3 FSINFO).
+
+	--( Command: mknod
+	Consolidated mknod-blk and mknod-chr into unified mknod command.
+	Now supports chr, blk, fifo, and sock types.
+
+	--( Command: pathconf
+	New command for POSIX path configuration (NFS v3 PATHCONF).
+
+	--( Command: protocol
+	Renamed 'version' command for clarity and reworked output.
+
+	--( Build
+	Added no-readline build targets (make norl, make norl-static) for
+	minimal-dependency deployments where readline is unavailable.
+
+1.7
+	--( Architecture
+	Refactored codebase into modular components.
+
+	--( Performance
+	Multiple performance enhancements across the codebase.
+
+	--( Network
+	Various fixes/improvements to the IP spoofing code.
+	Added send timeout to match receive timeout.
+
+	--( Bugfix
+	Fixed XID displayed in wrong byte order in RPC error messages.
+
+	--( Bugfix
+	Fixed resource leaks.
+
+	--( Bugfix
+	Fixed signed/unsigned comparison warnings throughout codebase.
+
+	--( Security
+	Added bounds checking to mount and portmap response parsing.
+	Added payload length underflow protection.
+
+	--( Command: lookup/getattr
+	Added -l flag for long format output showing ATIME/CTIME/FSID/FID.
+
+1.6
+	--( NFS v2 support
+	Added mount v1 / NFS 2 support and 'version' command.
+	Implemented synthetic READDIRPLUS using discrete NFS v2 calls.
+	Implemented the RPC portmapper 'dump' procedure.
+
+	--( Bugfix:
+	Memory leak in explore command.
+
+	--( Bugfix:
+	Uninitialised variable usage in explore command.
+
+	--( Bugfix:
+	NFS read commands (cat/get/getoff) now show correct size.
+
+	--( Bugfix:
+	Fixed incorrect error message in 'getoff' command.
+
+	--( Bugfix:
+	Better handling of mount commands when 'getport' hasn't been used.
+	Consistent behaviour across exports/dump/getfh/mnt/umntall.
+
+	--( Command: create/mkdir/mknod/put/setattr/symlink
+	These now take an octal mode argument, which is more intuitive.
+
+	--( Command: rpcinfo
+	New command to dump portmapper output for debugging and analysis.
+
+	--( CLI
+	Tab-completion of commands added.
+	Improved help text for several commands.
+	Implemented handy shell escape.
+
 1.5
 	--( Command line option: --arp-spoof removed
 	A thread sedning ARP reply packets are now started automatically
@@ -184,4 +290,5 @@ FreeBSD 13.1:
 run 'make' or 'make static'
 
 -=[ Author
-Copyright 2023, Claes M. Nyberg <cmn@signedness.org>
+Copyright 2023-2026, Claes M. Nyberg <cmn@signedness.org>
+Copyright 2025-2026, John Cartwright <johnc@grok.org.uk>

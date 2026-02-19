@@ -1,22 +1,23 @@
-
 /*
- * Copyright (C)  2023-2024 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2023-2026 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2025-2026 John Cartwright <johnc@grok.org.uk>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
  * 1. Redistributions of source code must retain the above copyright
- *	notice, this list of conditions and the following disclaimer.
+ *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
- *	notice, this list of conditions and the following disclaimer in the
- *	documentation and/or other materials provided with the distribution.
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
  * 3. All advertising materials mentioning features or use of this software
- *	must display the following acknowledgement:
- *	  This product includes software developed by Claes M Nyberg.
- * 4. The name Claes M Nyberg may not be used to endorse or promote
- *	products derived from this software without specific prior written
- *	permission.
+ *    must display the following acknowledgement:
+ *      This product includes software developed by Claes M Nyberg and
+ *      John Cartwright.
+ * 4. The names Claes M Nyberg and John Cartwright may not be used to endorse
+ *    or promote products derived from this software without specific prior written
+ *    permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY
  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -31,2202 +32,2828 @@
  * SUCH DAMAGE.
  */
 
-#include <stdio.h>
+/*
+ * nfsv3.c - NFSv3 protocol implementation (RFC 1813)
+ *
+ * Pure NFSv3 implementation using variable-length file handles (max 64 bytes)
+ * and 64-bit offsets. All functions return data via output parameters and
+ * never print directly.
+ */
+
 #include <stdlib.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <string.h>
-#include <errno.h>
-#include <sys/ioctl.h>
+#include <sys/time.h>
 
+#include "nfs_ops.h"
 #include "nfscli.h"
-
-#define TABALIGN	32
-
-/*
- * Convert RPC error to string
- */
-char *
-rpc_exec_errstr(int err)
-{
-	switch (err) {
-		case RPC_EXEC_SUCCESS: return(""); break;
-		case RPC_ERR_PROG_UNAVAIL: return("Program not available"); break;
-		case RPC_ERR_PROG_MISMATCH: return("Unsupported version"); break;
-		case RPC_ERR_PROG_NOTSUPP: return("Procedure not supported"); break;
-		case RPC_ERR_PROG_DECODE: return("Can not decode params"); break;
-		case RPC_ERR_PROG_MEM: return("Memory allocation failure"); break;
-	}
-
-	return "Unknown";
-}
-
+#include "nfsv3.h"
+#include "print.h"
+#include "rpc.h"
 
 /*
- * Convert NFSV3 error to errno
+ * Build NFSv3 sattr3 into buffer (variable length).
+ *
+ * RFC 1813 Section 2.5 - sattr3 structure
+ *
+ * Unlike NFSv2, NFSv3 sattr3 is variable-length:
+ *   set_mode3:  bool set_it; [mode3 mode if TRUE]
+ *   set_uid3:   bool set_it; [uid3 uid if TRUE]
+ *   set_gid3:   bool set_it; [gid3 gid if TRUE]
+ *   set_size3:  bool set_it; [size3 size if TRUE]
+ *   set_atime:  time_how (0=DONT_CHANGE, 1=SET_TO_SERVER_TIME, 2=SET_TO_CLIENT_TIME)
+ *               [nfstime3 if SET_TO_CLIENT_TIME]
+ *   set_mtime:  same as atime
+ *
+ * Returns pointer past the written data.
  */
-static int 
-nfsv3_err2errno(int err)
+static uint8_t *
+nfsv3_build_sattr3(uint8_t *pt, const struct nfs_sattr *sattr)
 {
-	switch (err) {
-		case NFSV3ERR_PERM:	return EPERM;
-		case NFSV3ERR_NOENT: return ENOENT;
-		case NFSV3ERR_IO: return EIO;
-		case NFSV3ERR_NXIO: return ENXIO;
-		case NFSV3ERR_ACCESS: return EACCES;
-		case NFSV3ERR_EXIST: return EEXIST;
-		case NFSV3ERR_XDEV: return EXDEV;
-		case NFSV3ERR_NODEV: return ENODEV;
-		case NFSV3ERR_NOTDIR: return ENOTDIR;
-		case NFSV3ERR_ISDIR: return EISDIR;
-		case NFSV3ERR_INVAL: return EINVAL;
-		case NFSV3ERR_FBIG: return EFBIG;
-		case NFSV3ERR_NOSPC: return ENOSPC;
-		case NFSV3ERR_ROFS: return EROFS;
-		case NFS3VERR_MLINK: return EMLINK;
-		case NFS3VERR_NAMETOOLONG: return ENAMETOOLONG;
-		case NFS3VERR_NOTEMPTY: return ENOTEMPTY;
-		case NFS3VERR_DQUOT: return EDQUOT;
-		case NFS3VERR_STALE: return ESTALE;
-		case NFS3VERR_BADHANDLE: return EBADF;
-#ifndef __FreeBSD__
-		case NFS3VERR_NOT_SYNC: return EL2NSYNC;
-#endif
-		case NFS3VERR_BAD_COOKIE: return ESTALE;
-		case NFS3VERR_NOTSUPP: return ENOTSUP;
-		case NFS3VERR_TOOSMALL: return ENOBUFS;
-		case NFS3VERR_SERVERFAULT: return ECANCELED;
-#ifndef __FreeBSD__
-		case NFS3VERR_BADTYPE: return EMEDIUMTYPE;
-#endif
-		case NFS3VERR_JUKEBOX: return ECANCELED;
-	}
-	return 0;
-}
+    /* mode */
+    if (sattr->set_mode) {
+        pt = xdr_build_u32(pt, 1);
+        pt = xdr_build_u32(pt, sattr->mode);
+    } else {
+        pt = xdr_build_u32(pt, 0);
+    }
 
-/*
- * Convert NFSV3 error to string
- */
-const char *
-nfsv3_errstr(int err)
-{
-	switch (err) {
-		case NFSV3ERR_PERM: return "Not owner";
-		case NFSV3ERR_NOENT: return "No such file or directory";
-		case NFSV3ERR_IO: return "A hard error occurred when the operation was in progress";
-		case NFSV3ERR_NXIO: return "No such device or address";
-		case NFSV3ERR_ACCESS: return "Permission denied";
-		case NFSV3ERR_EXIST: return "File exists";
-		case NFSV3ERR_XDEV: return "Attempt to do an operation across the file system";
-		case NFSV3ERR_NODEV: return "No such device";
-		case NFSV3ERR_NOTDIR: return "Not a directory";
-		case NFSV3ERR_ISDIR: return "Is a director";
-		case NFSV3ERR_INVAL: return "Invalid argument";
-		case NFSV3ERR_FBIG: return "File too large";
-		case NFSV3ERR_NOSPC: return "No space left on device";
-		case NFSV3ERR_ROFS: return "Read-only file system";
-		case NFS3VERR_MLINK: return "Too many links";
-		case NFS3VERR_NAMETOOLONG: return "File name too long";
-		case NFS3VERR_NOTEMPTY: return "Directory not empty";
-		case NFS3VERR_DQUOT: return "Disk quota exceeded";
-		case NFS3VERR_STALE: return "The file handle given in the arguments is no longer valid";
-		case NFS3VERR_BADHANDLE: return "File handle is not valid";
-		case NFS3VERR_NOT_SYNC: return "Synchronization mismatch on SETATTR"; 
-		case NFS3VERR_BAD_COOKIE: return "READDIR and READDIRPLUS cookie is stale"; 
-		case NFS3VERR_NOTSUPP: return "Operation is not supported.";
-		case NFS3VERR_TOOSMALL: return "Buffer or request is too small";
-		case NFS3VERR_SERVERFAULT: return "Server abandons the request";
-		case NFS3VERR_BADTYPE: return "Type of an object is not supported";
-		case NFS3VERR_JUKEBOX: return "Request was initiated, but not completed";
-	}
-	return "Unknown";
-}
+    /* uid */
+    if (sattr->set_uid) {
+        pt = xdr_build_u32(pt, 1);
+        pt = xdr_build_u32(pt, sattr->uid);
+    } else {
+        pt = xdr_build_u32(pt, 0);
+    }
 
+    /* gid */
+    if (sattr->set_gid) {
+        pt = xdr_build_u32(pt, 1);
+        pt = xdr_build_u32(pt, sattr->gid);
+    } else {
+        pt = xdr_build_u32(pt, 0);
+    }
 
-/*
- * Rewrite filenames using ANSI escape sequences 
- * Returns the number of escape characters on success 
- */
-#include "ansicolors.h"
-int
-ansi_highlight_filename(int colors, struct entattr *attr, char *name, char *buf, uint32_t buflen)
-{
-	char *clr = "";
+    /* size (64-bit) */
+    if (sattr->set_size) {
+        pt = xdr_build_u32(pt, 1);
+        pt = xdr_build_u64(pt, sattr->size);
+    } else {
+        pt = xdr_build_u32(pt, 0);
+    }
 
-	if (colors == 0) {
-		snprintf(buf, buflen, "%s", name);
-		return 0;
-	}
+    /* atime: 0=DONT_CHANGE, 1=SET_TO_SERVER_TIME, 2=SET_TO_CLIENT_TIME */
+    pt = xdr_build_u32(pt, sattr->set_atime);
+    if (sattr->set_atime == NFS_TIME_SET_TO_CLIENT) {
+        pt = xdr_build_u32(pt, sattr->atime.sec);
+        pt = xdr_build_u32(pt, sattr->atime.nsec);
+    }
 
-	if (strcmp(name, "shadow") == 0) 
-		clr = COLOR_BRED;
-	else if (strcmp(name, "passwd") == 0) 
-		clr = COLOR_BRED;
-	else if (strcmp(name, "master.passwd") == 0) 
-		clr = COLOR_BRED;
-	else if (strcmp(name, "authorized_keys") == 0) 
-		clr = COLOR_BRED;
-	else if (strstr(name, "secret") != 0)
-		clr = COLOR_BRED;
-	else if (strstr(name, "password") != 0)
-		clr = COLOR_BRED;
-	else if (strstr(name, "id_rsa") != 0)
-		clr = COLOR_BRED;
-	else if (strstr(name, "id_ed") != 0)
-		clr = COLOR_BRED;
-	
-	if (attr != NULL) {
+    /* mtime: same as atime */
+    pt = xdr_build_u32(pt, sattr->set_mtime);
+    if (sattr->set_mtime == NFS_TIME_SET_TO_CLIENT) {
+        pt = xdr_build_u32(pt, sattr->mtime.sec);
+        pt = xdr_build_u32(pt, sattr->mtime.nsec);
+    }
 
-		/* File type */
-		switch (ntohl(attr->type)) {
-			case 1: /* Regular File */
-				
-				/* Executable file */
-				if (attr->mode & 64)
-					clr = COLOR_BGREEN;
-				if (attr->mode & 8)
-					clr = COLOR_BGREEN;
-				if (attr->mode & 1)
-					clr = COLOR_BGREEN;
-				
-				/* Setuid */
-				if (attr->mode & 2048)
-					clr = COLOR_GREENB;
-				if (attr->mode & 1024)
-					clr = COLOR_GREENB;
-				break; 
-
-			case 2: clr = COLOR_BBLUE; break;  /* d */
-			case 3: ; break;  /* b */
-			case 4: ; break;  /* c */
-			case 5: clr = COLOR_BMAGENTA; break;  /* l */
-			case 6: ; break;  /* s */
-		}
-	}
-
-	snprintf(buf, buflen, "%s%s%s", clr, name, clr[0] ? COLOR_RESET : "");
-	return (strlen(buf) - strlen(name));
+    return pt;
 }
 
 /*
- * Create attribute string
- * Returns a pointer to buffer on success, NULL on error.
+ * Calculate size of sattr3 encoding for buffer allocation
  */
-char *
-nfsv3_attrstr(struct nfsctx *ctx, struct entattr *attr, 
-	uint32_t opts, char *name, char *buf, size_t buflen)
+static size_t
+nfsv3_sattr3_size(const struct nfs_sattr *sattr)
 {
-	char tmp[512];
-	char tmp2[64];
-	size_t i;
+    size_t size = 0;
 
-	i = 0;
-	memset(buf, 0x00, buflen);
+    /* mode: 1 word for set_it, 1 word for value if set */
+    size += XDR_UNIT + (sattr->set_mode ? XDR_UNIT : 0);
+    /* uid */
+    size += XDR_UNIT + (sattr->set_uid ? XDR_UNIT : 0);
+    /* gid */
+    size += XDR_UNIT + (sattr->set_gid ? XDR_UNIT : 0);
+    /* size: 1 word for set_it, 2 words for 64-bit value if set */
+    size += XDR_UNIT + (sattr->set_size ? 2 * XDR_UNIT : 0);
+    /* atime: 1 word for time_how, 2 words for nfstime3 if client time */
+    size += XDR_UNIT + (sattr->set_atime == NFS_TIME_SET_TO_CLIENT ? 2 * XDR_UNIT : 0);
+    /* mtime: same as atime */
+    size += XDR_UNIT + (sattr->set_mtime == NFS_TIME_SET_TO_CLIENT ? 2 * XDR_UNIT : 0);
 
-	/* Type */
-	switch (ntohl(attr->type)) {
-		case 1: buf[i] = '-'; break;
-		case 2: buf[i] = 'd'; break;
-		case 3: buf[i] = 'b'; break;
-		case 4: buf[i] = 'c'; break;
-		case 5: buf[i] = 'l'; break;
-		case 6: buf[i] = 's'; break;
-
-		default:
-			buf[i] = '?';
-			break;
-	}
-	i++;
-
-	if (i >= buflen)
-		goto truncated;
-
-	/* Permissions */
-	if ( (i+12) > buflen)
-		goto truncated;
-
-	attr->mode = ntohl(attr->mode);
-
-	/* Owner */
-	buf[i++] = (attr->mode & 256) ? 'r' : '-';
-	buf[i++] = (attr->mode & 128) ? 'w' : '-';
-	if (attr->mode & 2048)
-		buf[i++] = (attr->mode & 64) ? 's' : 'S';
-	else 
-		buf[i++] = (attr->mode & 64) ? 'x' : '-';
-
-   /* Group */
-   buf[i++] = (attr->mode & 32) ? 'r' : '-';
-   buf[i++] = (attr->mode & 16) ? 'w' : '-';
-   if (attr->mode & 1024)
-		buf[i++] = (attr->mode & 8) ? 's' : 'S';
-   else
-	   buf[i++] = (attr->mode & 8) ? 'x' : '-';
-
-	/* World */
-	buf[i++] = (attr->mode & 4) ? 'r' : '-';
-	buf[i++] = (attr->mode & 2) ? 'w' : '-';
-	if (attr->mode & 512)
-		buf[i++] = (attr->mode & 1) ? 't' : 'T';
-	else
-		buf[i++] = (attr->mode & 1) ? 'x' : '-';
-	
-	/* Number of links */
-	attr->nlink = ntohl(attr->nlink);
-	snprintf(tmp, sizeof(tmp), "%4u ",	attr->nlink);
-	if ( (i + strlen(tmp)) >= buflen)
-		goto truncated;
-
-	memcpy(&buf[i], tmp, strlen(tmp));
-	i += strlen(tmp);
-
-	/* UID, GID */
-	snprintf(tmp, sizeof(tmp), "  %-4u %-4u ", ntohl(attr->uid), ntohl(attr->gid));
-	if ( (i + strlen(tmp)) >= buflen)
-		goto truncated;
-	
-	memcpy(&buf[i], tmp, strlen(tmp));
-	i += strlen(tmp);
-
-	/* Size */
-	snprintf(tmp, sizeof(tmp), "%6s  ",  str_hsize(be64toh(attr->size)));
-	if ( (i + strlen(tmp)) >= buflen)
-		goto truncated;
-
-	memcpy(&buf[i], tmp, strlen(tmp));
-	i += strlen(tmp);
-
-	/* atime */
-	if (opts & ATTRSTR_LONG) {
-		str_time(tmp2, sizeof(tmp2), ntohl(attr->atime.secs));
-		snprintf(tmp, sizeof(tmp), " ATIME:%s MTIME:", tmp2);
-
-		if ( (i + strlen(tmp)) >= buflen)
-			goto truncated;
-
-		memcpy(&buf[i], tmp, strlen(tmp));
-		i += strlen(tmp);
-	}
-
-	/* mtime */
-	str_time(tmp2, sizeof(tmp2), ntohl(attr->mtime.secs));
-	snprintf(tmp, sizeof(tmp), "%s ", tmp2);
-
-	if ( (i + strlen(tmp)) >= buflen)
-		goto truncated;
-
-	memcpy(&buf[i], tmp, strlen(tmp));
-	i += strlen(tmp);
-
-
-	/* ctime */
-	if (opts & ATTRSTR_LONG) {
-		str_time(tmp2, sizeof(tmp2), ntohl(attr->ctime.secs));
-		snprintf(tmp, sizeof(tmp), "CTIME:%s ", tmp2);
-
-		if ( (i + strlen(tmp)) >= buflen)
-			goto truncated;
-
-		memcpy(&buf[i], tmp, strlen(tmp));
-		i += strlen(tmp);
-	}
-
-	/* Name */
-	if (name != NULL) {
-		int len;
-		char nametmp[256];
-		int escapechars = 0;
-
-#define NAMEALIGN 32
-
-		escapechars = ansi_highlight_filename(opts & ATTRSTR_COLORS, 
-			attr, name, nametmp, sizeof(nametmp));	
-
-		memset(tmp, 0x00, sizeof(tmp));
-		snprintf(tmp, sizeof(tmp)-NAMEALIGN, " %s ", nametmp);
-		len = strlen(tmp);
-		while (len < NAMEALIGN + escapechars) {
-			tmp[len] = '_';
-			len++;
-		}
-
-		tmp[len++] = ' ';
-		tmp[len] = '\0';
-
-		if ( (i + strlen(tmp)) >= buflen)
-			goto truncated;
-
-		memcpy(&buf[i], tmp, strlen(tmp));
-		i += strlen(tmp);
-	}
-
-	if (opts & ATTRSTR_LONG) {
-		snprintf(tmp, sizeof(tmp), " FSID:0x%lx FID:0x%-8lx", 
-			be64toh(attr->fsid), be64toh(attr->fid));
-	
-		if ( (i + strlen(tmp)) >= buflen)
-			goto truncated;
-
-		memcpy(&buf[i], tmp, strlen(tmp));
-		i += strlen(tmp);
-	}
-
-finished:
-	return buf;
-
-truncated:
-	print(0, ctx, "** Warning, output truncated due to small buffer");
-	goto finished;
+    return size;
 }
 
 /*
- * do GETATTR
+ * Build sattr3 for mode-only operations (create, symlink, mkdir).
+ * Size is fixed: 7 words (mode=set with value, rest=don't change)
  */
-int
-nfsv3_getattr(struct nfsctx *ctx, uint8_t *fhandle, uint32_t fhlen, struct entattr *save)
+#define NFSV3_SATTR3_MODE_SIZE (7 * XDR_UNIT)
+
+static uint8_t *
+nfsv3_build_sattr3_mode(uint8_t *pt, uint32_t mode)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint8_t *pt;
-	ssize_t n;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(fhlen, 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_GETATTR);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(fhlen);
-	pt += 4;
-	memcpy(pt, fhandle, fhlen);
-	pt += ALIGN(fhlen, 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-
-	if ((pt + sizeof(struct entattr)) > &buf[n]) {
-		fprintf(stderr, "** Error: Response data exceeds length of read data\n");
-		return -1;
-	}
-
-	memcpy(save, pt, sizeof(struct entattr));
-	return 0;
-}
-
-
-/*
- * do LOOKUP
- * Returns the length of the looked up file handle on succes,
- * and -1 on error. 
- */
-int
-nfsv3_lookup(struct nfsctx *ctx, uint8_t *fhandle, 
-	uint32_t fhlen, char *name, struct lookup_ret *save)
-{
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint32_t value_follows;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint8_t *pt;
-	ssize_t n;
-	uint32_t len;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(fhlen, 4);
-	totlen += 4 + ALIGN(strlen(name), 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_LOOKUP);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(fhlen);
-	pt += 4;
-	memcpy(pt, fhandle, fhlen);
-	pt += ALIGN(fhlen, 4);
-
-	if (strlen(name) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: name exceeds %u bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-
-	/* Name */
-	*(uint32_t *)pt = htonl(strlen(name));
-	pt += 4;
-	memcpy(pt, name, strlen(name));
-	pt += ALIGN(strlen(name), 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-	len = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	if ((pt + len) > &buf[n]) {
-		fprintf(stderr, "** Error: Length exceeds reply buffer\n");
-		return -1;
-	}
-
-	if (len > sizeof(save->fh)) {
-		fprintf(stderr, "** Error: FH Length exceeds save buffer\n");
-		return -1;
-	}
-
-	memcpy(save->fh, pt, len);
-	save->fhlen = len;
-	pt += ALIGN(len, 4);
-
-	/* Object attributes */
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-	if (value_follows == 1) {
-		if ((pt + sizeof(struct entattr)) > &buf[n]) {
-			fprintf(stderr, "** Error: Response data exceeds length of read data\n");
-			return -1;
-		}
-		memcpy(&save->obj_attr, pt, sizeof(struct entattr));
-	}
-
-	/* Directory attributes */
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-	if (value_follows == 1) {
-		if ((pt + sizeof(struct entattr)) > &buf[n]) {
-			fprintf(stderr, "** Error: Response data exceeds length of read data\n");
-			return -1;
-		}
-		memcpy(&save->dir_attr, pt, sizeof(struct entattr));
-	}
-
-	return 0;
-}
-
-
-/*
- * Do RENAME
- */
-int
-nfsv3_rename(struct nfsctx *ctx, struct nfsv3_rename_args *args)
-{
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint32_t *len;
-	uint8_t *pt;
-	ssize_t n;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + args->srcfhlen;
-	totlen += 4 + ALIGN(strlen(args->srcname), 4);
-	totlen += 4 + args->dstfhlen;
-	totlen += 4 + ALIGN(strlen(args->dstname), 4);
-	totlen = ALIGN(totlen, 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_RENAME);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	if (strlen(args->srcname) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: src name exceeds %s bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-
-	if (strlen(args->dstname) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: dst name exceeds %s bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-
-	/* Src dir fh */
-	len = (uint32_t *)pt;
-	*len = htonl(ALIGN(args->srcfhlen, 4));
-	pt += 4;
-	memcpy(pt, args->srcfh, args->srcfhlen);
-	pt += ALIGN(args->srcfhlen, 4);
-
-	/* Src dir file name */
-	len = (uint32_t *)pt;
-	*len = htonl(strlen(args->srcname));
-	pt += 4;
-	memcpy(pt, args->srcname, strlen(args->srcname));
-	pt += ALIGN(strlen(args->srcname), 4);
-
-	/* Dest dir fh */
-	len = (uint32_t *)pt;
-	*len = htonl(ALIGN(args->dstfhlen, 4));
-	pt += 4;
-	memcpy(pt, args->dstfh, args->dstfhlen);
-	pt += ALIGN(args->dstfhlen, 4);
-
-	/* Dest dir filename */
-	len = (uint32_t *)pt;
-	*len = htonl(strlen(args->dstname));
-	pt += 4;
-	memcpy(pt, args->dstname, strlen(args->dstname));
-	pt += ALIGN(strlen(args->dstname), 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-
-	return 0;
-}
-
-
-/*
- * Do RMDIR
- */
-int
-nfsv3_rmdir(struct nfsctx *ctx, struct nfsv3_rmdir_args *args)
-{
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint8_t *pt;	
-	ssize_t n;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_RMDIR);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-
-	if (strlen(args->name) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: name exceeds %u bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-
-	/* Name */
-	*(uint32_t *)pt = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-
-	return 0;
+    /* mode: set_it=1, value */
+    pt = xdr_build_u32(pt, 1);
+    pt = xdr_build_u32(pt, mode);
+    /* uid: set_it=0 */
+    pt = xdr_build_u32(pt, 0);
+    /* gid: set_it=0 */
+    pt = xdr_build_u32(pt, 0);
+    /* size: set_it=0 */
+    pt = xdr_build_u32(pt, 0);
+    /* atime: DONT_CHANGE */
+    pt = xdr_build_u32(pt, 0);
+    /* mtime: DONT_CHANGE */
+    pt = xdr_build_u32(pt, 0);
+    return pt;
 }
 
 /*
- * Do CREATE
+ * Parse NFSv3 file attributes from wire format to common format.
+ *
+ * RFC 1813 Section 2.5 - fattr3 structure
+ *
+ * NFSv3 improvements over NFSv2:
+ * - 64-bit sizes and offsets (files > 4GB)
+ * - Nanosecond timestamp resolution
+ * - Separate major/minor device numbers
+ * - 64-bit file IDs (no inode overflow)
+ * - 'used' field for actual space consumed (sparse files)
  */
-int
-nfsv3_create(struct nfsctx *ctx, struct nfsv3_create_args *args)
+static void
+nfsv3_parse_fattr(const struct nfsv3_fattr *wire, struct nfs_attr *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	struct setattr *attr;
-	uint32_t value_follows;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint8_t *pt;	
-	ssize_t n;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
-	totlen += 4;
-	totlen += sizeof(struct setattr);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_CREATE);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-
-	if (strlen(args->name) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: name exceeds %u bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-
-	/* Name */
-	*(uint32_t *)pt = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
-
-	/* Create mode 
-	 *   0 == UNCHECKED
-	 *   1 == GUARDED
-	 *   2 == EXCLUSIVE
-	 */
-	*(uint32_t *)pt = htonl(1);
-	pt += 4;
-
-	/* Attributes, we just set mode for now */
-	attr = (struct setattr *)pt;
-	pt += sizeof(struct setattr);
-	attr->mode_value_follows = htonl(1);
-	attr->mode = htonl(args->mode);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* File handle */
-	if (value_follows == 1) {
-		uint32_t len = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		if (len > FHMAXLEN) {
-			print(1, ctx, "** Error: Returned file handle length exceeds buffer size\n");
-			return -1;
-		}
-
-		args->newfhlen = len;
-		memcpy(args->newfh, pt, args->newfhlen);
-		pt += ALIGN(args->newfhlen, 4);
-
-		printf("Created FH: ");
-		HEXDUMP(args->newfh, args->newfhlen);
-	}
-
-	/* Object attributes follow */
-	/* dir_wcc follow */
-
-	return 0;
+    out->type = ntohl(wire->type);
+    out->mode = ntohl(wire->mode);
+    out->nlink = ntohl(wire->nlink);
+    out->uid = ntohl(wire->uid);
+    out->gid = ntohl(wire->gid);
+    out->size = be64toh(wire->size);
+    out->used = be64toh(wire->used);
+    out->rdev = ((uint64_t)ntohl(wire->rdev_major) << 32) | ntohl(wire->rdev_minor);
+    out->fsid = be64toh(wire->fsid);
+    out->fileid = be64toh(wire->fileid);
+    out->atime.sec = ntohl(wire->atime_sec);
+    out->atime.nsec = ntohl(wire->atime_nsec);
+    out->mtime.sec = ntohl(wire->mtime_sec);
+    out->mtime.nsec = ntohl(wire->mtime_nsec);
+    out->ctime.sec = ntohl(wire->ctime_sec);
+    out->ctime.nsec = ntohl(wire->ctime_nsec);
 }
 
 /*
- * Do REMOVE
+ * Build file handle into buffer (variable length for v3)
+ * Returns pointer past the written data
  */
-int
-nfsv3_remove(struct nfsctx *ctx, struct nfsv3_remove_args *args)
+static uint8_t *
+nfsv3_build_fh(uint8_t *pt, const struct nfs_fh *fh)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint8_t *pt;	
-	ssize_t n;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_REMOVE);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-
-	/* Name */
-	if (strlen(args->name) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: name exceeds %s bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-	*(uint32_t *)pt = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-
-	return 0;
+    return xdr_build_opaque(pt, fh->data, fh->len);
 }
 
 /*
- * Do SETATTR
+ * Build string into buffer (XDR string format)
+ * Returns pointer past the written data
  */
-int
-nfsv3_setattr(struct nfsctx *ctx, struct nfsv3_setattr_args *args)
+static uint8_t *
+nfsv3_build_string(uint8_t *pt, const char *str)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	struct setattr *attr;
-	uint8_t buf[8192];
-	size_t totlen;
-	uint8_t *pt;	
-	ssize_t n;
-	uint32_t xid;
-
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += sizeof(struct setattr);
-	totlen += 4; /* Guard */
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_SETATTR);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-		
-	/* Attributes, we just set mode for now */
-	attr = (struct setattr *)pt;
-	pt += sizeof(struct setattr);
-	memset(attr, 0x00, sizeof(struct setattr));
-	attr->mode_value_follows = htonl(1);
-	attr->mode = htonl(args->mode);
-
-	/* Guard */
-	*(uint32_t *)pt = htonl(0);
-	pt += 4;
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-
-	/* previous attributes follow */
-	/* current attributes follow */
-
-	return 0;
+    return xdr_build_string(pt, str);
 }
 
 /*
- * Do MKDIR
+ * Parse file handle from buffer
+ * Returns pointer past the parsed data, or NULL on error
  */
-int
-nfsv3_mkdir(struct nfsctx *ctx, struct nfsv3_mkdir_args *args)
+static uint8_t *
+nfsv3_parse_fh(uint8_t *pt, uint8_t *end, struct nfs_fh *fh)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	struct setattr *attr;
-	uint8_t buf[8192];
-	uint32_t value_follows;
-	uint32_t len;
-	size_t totlen;
-	uint8_t *pt;	
-	ssize_t n;
-	uint32_t xid;
+    uint32_t len;
+    uint32_t len_padded;
 
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+    if (pt + XDR_UNIT > end)
+        return NULL;
 
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
-	totlen += sizeof(struct setattr);
+    len = xdr_get_u32(pt);
+    pt += XDR_UNIT;
 
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
+    /* Validate length BEFORE XDR_ALIGN to prevent overflow */
+    if (len == 0 || len > NFSV3_FHSIZE)
+        return NULL;
+    len_padded = XDR_ALIGN(len);
 
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_MKDIR);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    /* Check bounds with aligned length */
+    if (pt + len_padded > end)
+        return NULL;
 
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-	
-	/* Name */
-	if (strlen(args->name) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: name exceeds %s bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
-	*(uint32_t *)pt = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
-
-	/* Attributes, we just set mode for now */
-	attr = (struct setattr *)pt;
-	pt += sizeof(struct setattr);
-	memset(attr, 0x00, sizeof(struct setattr));
-	attr->mode_value_follows = htonl(1);
-	attr->mode = htonl(args->mode);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* File handle */
-	if (value_follows == 1) {
-		len = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		printf("FH:");
-		HEXDUMP(pt, len);
-		pt += ALIGN(len, 4);
-	}
-
-	/* Object attributes follow */
-	/* dir_wcc follow */
-
-	return 0;
+    nfs_fh_from_buf(fh, pt, len);
+    pt += len_padded;
+    return pt;
 }
 
 /*
- * Do WRITE
+ * Parse post_op_attr (optional file attributes).
+ *
+ * RFC 1813 Section 2.5 - post_op_attr
+ *   union switch (bool attributes_follow) {
+ *       TRUE:  fattr3 attributes;
+ *       FALSE: void;
+ *   };
+ *
+ * If attr is NULL, attributes are skipped but pointer still advances.
+ * If has_attr is not NULL, set to 1 if attributes were present.
+ * Returns pointer past the parsed data, or NULL on bounds error.
  */
-int
-nfsv3_write(struct nfsctx *ctx, struct nfsv3_write_args *args)
+static uint8_t *
+nfsv3_parse_post_op_attr(uint8_t *pt, uint8_t *end,
+    struct nfs_attr *attr, int *has_attr)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[4096];
-	uint8_t *pt;
-	size_t totlen;
-	ssize_t n;
+    uint32_t value_follows;
 
-	struct write_call_footer {
-		uint64_t offset;
-		uint32_t count;
-		uint32_t stable;
+    if (pt + XDR_UNIT > end)
+        return NULL;
 
-		uint32_t datalen; /* CHECK RFC, FUZZ: Must be same as count ? */
-		/* Data goes here */
-	} __attribute__((packed)) *footer;
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
 
-	uint32_t xid;
+    if (value_follows) {
+        if (pt + sizeof(struct nfsv3_fattr) > end)
+            return NULL;
+        if (attr != NULL)
+            nfsv3_parse_fattr((struct nfsv3_fattr *)pt, attr);
+        if (has_attr != NULL)
+            *has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    } else {
+        if (has_attr != NULL)
+            *has_attr = 0;
+    }
 
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += sizeof(struct write_call_footer);
-	totlen += ALIGN(args->count, 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_WRITE);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-		
-	footer = (struct write_call_footer *)pt;
-	pt += sizeof(struct write_call_footer);
-
-	footer->offset = htobe64(args->offset);
-	footer->count = htonl(args->count);
-	//footer->stable = htonl(0); /* 0 == UNSTABLE */
-	//footer->stable = htonl(1); /* 1 == DATA_SYNC */
-	footer->stable = htonl(2); /* 2 == FILE_SYNC, commit to storage before returning */
-	footer->datalen = htonl(args->count);
-	
-	memcpy(pt, args->data, args->count);
-	pt += ALIGN(args->count, 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, (uint8_t *)buf, totlen) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-	print(1, ctx, "Wrote %u bytes of data\n", args->count);
-
-		/* Before and after attributes */
-		/* Count */
-		/* Comitted */
-		/* Verifier */
-
-	return 0;
+    return pt;
 }
 
 /*
- * Do READ
+ * Skip pre_op_attr (wcc_attr) in wcc_data.
+ *
+ * RFC 1813 Section 2.5 - pre_op_attr (wcc_attr)
+ *   union switch (bool attributes_follow) {
+ *       TRUE:  wcc_attr { size3 size; nfstime3 mtime; nfstime3 ctime; };
+ *       FALSE: void;
+ *   };
+ *
+ * The pre_op_attr is 24 bytes if present: size(8) + mtime(8) + ctime(8).
+ * Returns pointer past the data, or NULL on bounds error.
  */
-int
-nfsv3_read(struct nfsctx *ctx, struct nfsv3_read_args *args, struct nfsv3_read_reply *ret)
+static uint8_t *
+nfsv3_skip_pre_op_attr(uint8_t *pt, uint8_t *end)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[4096];
-	uint32_t value_follows;
-	uint8_t *pt;
-	size_t totlen;
-	ssize_t n;
+    uint32_t value_follows;
 
-	struct read_call_footer {
-		uint64_t offset;
-		uint32_t count;
-	} __attribute__((packed)) *footer;
+    if (pt + XDR_UNIT > end)
+        return NULL;
 
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
 
-	uint32_t xid;
-	uint32_t buflen;
+    if (value_follows) {
+        /* wcc_attr: size(8) + mtime(8) + ctime(8) = 24 bytes */
+        if (pt + 24 > end)
+            return NULL;
+        pt += 24;
+    }
 
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += sizeof(struct read_call_footer);
-
-	if (totlen > sizeof(buf)) {
-		printf("** Error: Fileheader exceeds buffer length\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_READ);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-
-	footer = (struct read_call_footer *)pt;
-	pt += sizeof(struct read_call_footer);
-	footer->offset = htobe64(args->offset);
-	footer->count = htonl(args->count);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, (uint8_t *)buf, totlen) < 0) {
-		return -1;
-	}
-
-	buflen = sizeof(struct rpc_nfsreply_hdr);
-	buflen += ALIGN(args->count, 4) + sizeof(struct entattr);
-	buflen += 1024;
-
-	if ( (ret->buf = calloc(1, buflen)) == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-	
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, ret->buf, buflen)) < 0) {
-		return -1;
-	}
-
-	reply = (struct rpc_nfsreply_hdr *)ret->buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = ret->buf + sizeof(struct rpc_nfsreply_hdr);
-
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* Attributes */
-	if (value_follows == 1) {
-		pt += sizeof(struct entattr);
-	}
-
-	/* Count (same as len?) */
-	pt += 4;
-
-	/* eof */
-	ret->eof = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* len */
-	ret->len = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* data */
-	ret->data = pt;
-	pt += ALIGN(ret->len, 4);
-
-	print(1, ctx, "Received %u bytes of data (EOF=%u)\n",
-		ret->len, ret->eof);
-
-	return 0;
+    return pt;
 }
 
 /*
- * Do SYMLINK Call
+ * Skip wcc_data (pre_op_attr + post_op_attr) and optionally parse post_op_attr.
+ *
+ * RFC 1813 Section 2.5 - wcc_data
+ *   struct wcc_data {
+ *       pre_op_attr before;
+ *       post_op_attr after;
+ *   };
+ *
+ * If attr is not NULL, parses post_op_attr into it.
+ * If has_attr is not NULL, sets to 1 if post_op_attr was present.
+ * Returns pointer past the data, or NULL on bounds error.
  */
-int
-nfsv3_symlink(struct nfsctx *ctx, struct nfsv3_symlink_args *args)
+static uint8_t *
+nfsv3_parse_wcc_data(uint8_t *pt, uint8_t *end,
+    struct nfs_attr *attr, int *has_attr)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	struct setattr *attr;
-	uint8_t buf[IOBUFSIZE*2];
-	uint8_t *pt;
-	size_t totlen;
-	uint32_t xid;
-	ssize_t n;
+    /* Skip pre_op_attr */
+    pt = nfsv3_skip_pre_op_attr(pt, end);
+    if (pt == NULL)
+        return NULL;
 
-	xid = rand(); 
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-
-	totlen = sizeof(struct rpc_call_hdr); 
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
-	totlen += ALIGN(sizeof(struct entattr), 4);
-	totlen += 4 + ALIGN(strlen(args->to), 4);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, " ** Error: Total length exceeds buffer\n");
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_SYMLINK);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle for directory */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
-
-	/* Symbolic link name */ 
-	*(uint32_t *)pt = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
-
-	/* Attributes */
-	attr = (struct setattr *)pt;
-	pt += sizeof(struct setattr);
-	attr->mode_value_follows = htonl(1); 
-	attr->mode = htonl(args->mode);
-
-	/* To */ 
-	*(uint32_t *)pt = htonl(strlen(args->to));
-	pt += 4;
-	memcpy(pt, args->to, strlen(args->to));
-	pt += ALIGN(strlen(args->to), 4);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-
-	return 0;
+    /* Parse post_op_attr */
+    return nfsv3_parse_post_op_attr(pt, end, attr, has_attr);
 }
 
 /*
- * Do READLINK Call
+ * NFSv3 GETATTR (Procedure 1)
+ *
+ * RFC 1813 Section 3.3.1 - NFSPROC3_GETATTR
+ *
+ * Returns all file attributes. Does NOT follow symbolic links.
+ * Unlike NFSv2, GETATTR is the only procedure that never returns
+ * post_op_attr (since it returns the full attributes directly).
+ *
+ * Status codes: NFS3_OK, NFS3ERR_STALE, NFS3ERR_BADHANDLE,
+ *               NFS3ERR_SERVERFAULT
  */
-int
-nfsv3_readlink(struct nfsctx *ctx, uint8_t *fh, uint32_t fhlen)
+static int
+nfsv3_getattr_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_attr *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	//struct entattr *attr;
-	uint32_t len;
-	uint32_t data_follows;
-	uint8_t buf[IOBUFSIZE*2];
-	uint8_t *pt;
-	size_t totlen;
-	uint32_t xid;
-	ssize_t n;
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
 
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
 
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(fhlen, 4);
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
 
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, " ** Error: Total length exceeds buffer\n");
-		return -1;
-	}
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_GETATTR);
+    pt = buf + sizeof(struct rpc_call_hdr);
 
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_READLINK);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    pt = nfsv3_build_fh(pt, fh);
+    (void)pt; /* silence dead store warning */
 
-	/* File handle for symbolic link */
-	*(uint32_t *)pt = htonl(fhlen);
-	pt += 4;
-	memcpy(pt, fh, fhlen);
-	pt += ALIGN(fhlen, 4);
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
 
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
 
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
 
-	reply->status = ntohl(reply->status);
-	if (reply->status != NFSV3_OK) {
-		print(0, ctx, "** NFSV3 Error %d: %s\n", reply->status, nfsv3_errstr(reply->status));
-		print(1, ctx, "** Error: %s\n", nfsv3_errstr(reply->status));
-		errno = nfsv3_err2errno(reply->status);
-		return -1;
-	}
+    NFS_CHECK_STATUS(ctx, reply);
 
-	/* Post operation attributes */
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-	data_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-	if (data_follows) {
-		//attr = (struct entattr *)pt;
-		pt += sizeof(struct entattr);
-	}
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
 
-	/* Link data */
-	len = ntohl(*(uint32_t *)pt);
-	pt += 4;
+    if ((pt + sizeof(struct nfsv3_fattr)) > &buf[n]) {
+        errno = EBADMSG;
+        return -1;
+    }
 
-	if ( (pt + len) > &buf[n]) {
-		print(0, ctx, "** Error: length (%x) exceeds reply size\n", len);
-		return -1;
-	}
-
-	fwrite(pt, len, 1, stdout);
-	printf("\n");
-	return 0;
+    nfsv3_parse_fattr((struct nfsv3_fattr *)pt, out);
+    return 0;
 }
 
-
 /*
- * Do LINK Call
+ * NFSv3 SETATTR (Procedure 2)
+ *
+ * RFC 1813 Section 3.3.2 - NFSPROC3_SETATTR
+ *
+ * Sets file attributes. NOT atomic - partial changes may occur on failure.
+ * Uses sattr3 with explicit flags per field (unlike v2's -1 sentinel).
+ *
+ * sattrguard3: Optional ctime check to prevent lost updates. If guard.check
+ * is TRUE and ctime doesn't match, returns NFS3ERR_NOT_SYNC. This
+ * implementation does not use the guard.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_PERM, NFS3ERR_IO, NFS3ERR_ACCES,
+ *               NFS3ERR_INVAL, NFS3ERR_ROFS, NFS3ERR_NOT_SYNC
  */
-int
-nfsv3_link(struct nfsctx *ctx, struct nfsv3_link_args *args)
+static int
+nfsv3_setattr_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    const struct nfs_sattr *sattr, struct nfs_attr *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[IOBUFSIZE*2];
-	uint8_t *pt;
-	size_t totlen;
-	uint32_t xid;
-	ssize_t n;
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt, *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
 
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += nfsv3_sattr3_size(sattr);
+    totlen += XDR_UNIT; /* guard */
 
-	totlen = sizeof(struct rpc_call_hdr); 
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(args->dirfhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
 
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, " ** Error: Total length exceeds buffer\n");
-		return -1;
-	}
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_SETATTR);
+    pt = buf + sizeof(struct rpc_call_hdr);
 
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_LINK);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    pt = nfsv3_build_fh(pt, fh);
 
-	/* File handle for existing file */
-	*(uint32_t *)pt = htonl(args->fhlen);
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
+    /* Build sattr3 (variable length) */
+    pt = nfsv3_build_sattr3(pt, sattr);
 
-	/* File handle for directory */
-	*(uint32_t *)pt = htonl(args->dirfhlen);
-	pt += 4;
-	memcpy(pt, args->dirfh, args->dirfhlen);
-	pt += ALIGN(args->dirfhlen, 4);
+    /* Guard (no guard) */
+    pt = xdr_build_u32(pt, 0);
+    (void)pt;
 
-	/* File name */
-	*(uint32_t *)pt = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
 
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
 
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
 
-	return 0;
+    NFS_CHECK_STATUS(ctx, reply);
+
+    /* Parse wcc_data to extract post_op_attr if caller wants it */
+    if (out != NULL) {
+        const size_t wcc_attr_size = 24;
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
+
+        /* Skip pre_op_attr (wcc_attr: bool + optional 24 bytes) */
+        if (pt + XDR_UNIT > end)
+            return 0; /* Success, but no attrs to return */
+        value_follows = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        if (value_follows) {
+            /* wcc_attr: size(8) + mtime(8) + ctime(8) = 24 bytes */
+            if (pt + wcc_attr_size > end)
+                return 0;
+            pt += wcc_attr_size;
+        }
+
+        /* Bounds check after wcc_data before parsing post_op_attr */
+        if (pt + XDR_UNIT > end)
+            return 0;
+        value_follows = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        if (value_follows) {
+            if (pt + sizeof(struct nfsv3_fattr) > end)
+                return 0;
+            nfsv3_parse_fattr((struct nfsv3_fattr *)pt, out);
+        }
+    }
+
+    return 0;
 }
 
+/*
+ * NFSv3 LOOKUP (Procedure 3)
+ *
+ * RFC 1813 Section 3.3.3 - NFSPROC3_LOOKUP
+ *
+ * Searches directory for name, returns file handle and attributes.
+ * Does NOT follow symlinks. Returns post_op_attr for both the
+ * looked-up object and the directory (unlike NFSv2).
+ *
+ * Status codes: NFS3_OK, NFS3ERR_NOENT, NFS3ERR_ACCES, NFS3ERR_NOTDIR,
+ *               NFS3ERR_NAMETOOLONG, NFS3ERR_STALE, NFS3ERR_BADHANDLE
+ */
+static int
+nfsv3_lookup_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, struct nfs_lookup_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt;
+    uint8_t *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    size_t namelen = strlen(name);
 
+    if (namelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_LOOKUP);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* File handle */
+    pt = nfsv3_parse_fh(pt, end, &out->fh);
+    if (pt == NULL) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    /* Object attributes (optional) */
+    pt = nfsv3_parse_post_op_attr(pt, end, &out->obj_attr, &out->has_obj_attr);
+    if (pt == NULL) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    /* Directory attributes (optional) */
+    pt = nfsv3_parse_post_op_attr(pt, end, &out->dir_attr, &out->has_dir_attr);
+    if (pt == NULL) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    (void)pt; /* Silence unused warning - end of parsing */
+    return 0;
+}
 
 /*
- * Do READDIR Call
+ * NFSv3 READLINK (Procedure 5)
+ *
+ * RFC 1813 Section 3.3.5 - NFSPROC3_READLINK
+ *
+ * Returns symbolic link target path (not validated, may be dangling).
+ * Max path: NFS3_MAXPATHLEN (1024 bytes).
+ * Returns post_op_attr for the symlink.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_INVAL (not a symlink),
+ *               NFS3ERR_STALE, NFS3ERR_BADHANDLE, NFS3ERR_IO
  */
-int
-nfsv3_readdir(struct nfsctx *ctx, uint32_t opts, uint8_t *fhandle, uint32_t fhlen)
+static int
+nfsv3_readlink_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_readlink_res *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint32_t data_follows;
+    uint32_t len;
+    uint8_t *buf;
+    size_t bufsize = IOBUFSIZE * 2;
+    size_t totlen;
+    uint8_t *pt;
+    uint8_t *end;
+    ssize_t n;
+    uint32_t xid = rand();
 
-	struct readdir_call_footer {
-		uint64_t cookie;
-		uint64_t cookieverf;
-		uint32_t count;
-	} __attribute__((packed)) *footer;
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
 
-	uint8_t buf[IOBUFSIZE*2];
-	size_t totlen;
-	uint8_t *pt;
-	uint32_t value_follows;
-	uint64_t verifier;
-	uint64_t cookie;
-	uint32_t eof;
-	uint32_t xid;
-	uint64_t calls;
-	uint64_t tot;
-	ssize_t n;
+    if (totlen > bufsize) {
+        errno = ENOBUFS;
+        return -1;
+    }
 
-	verifier = 0;
-	cookie = 0;
-	calls = 0;
-	tot = 0;
+    buf = malloc(bufsize);
+    if (buf == NULL)
+        return -1;
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_READLINK);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, fh);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0) {
+        free(buf);
+        return -1;
+    }
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, bufsize, xid)) < 0) {
+        free(buf);
+        return -1;
+    }
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY_FREE(ctx, reply, n, buf);
+
+    NFS_CHECK_STATUS_EX(ctx, reply, free(buf));
+
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* Post operation attributes (optional) */
+    if (pt + XDR_UNIT > end) {
+        free(buf);
+        errno = EBADMSG;
+        return -1;
+    }
+    data_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (data_follows) {
+        if (pt + sizeof(struct nfsv3_fattr) > end) {
+            free(buf);
+            errno = EBADMSG;
+            return -1;
+        }
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
+
+    /* Link data */
+    if (pt + XDR_UNIT > end) {
+        free(buf);
+        errno = EBADMSG;
+        return -1;
+    }
+    len = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+
+    /* Validate length BEFORE XDR_ALIGN to prevent overflow */
+    if (len > NFS_MAXPATHLEN) {
+        free(buf);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    /* Validate length against output buffer size */
+    if (len >= sizeof(out->target)) {
+        free(buf);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    /* Check bounds with unpadded length (path_data is last field in response) */
+    if (len > (size_t)(end - pt)) {
+        free(buf);
+        errno = EBADMSG;
+        return -1;
+    }
+
+    memset(out->target, 0, sizeof(out->target));
+    memcpy(out->target, pt, len);
+    xdr_sanitize_string(out->target);
+    free(buf);
+    return 0;
+}
+
+/*
+ * NFSv3 READ (Procedure 6)
+ *
+ * RFC 1813 Section 3.3.6 - NFSPROC3_READ
+ *
+ * Reads data from file. Uses 64-bit offsets (unlike NFSv2's 32-bit).
+ * Returns explicit EOF flag (unlike NFSv2 which requires inference).
+ *
+ * The server may return fewer bytes than requested. EOF=TRUE with
+ * count=0 indicates reading past end of file.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_ACCES, NFS3ERR_INVAL, NFS3ERR_ISDIR,
+ *               NFS3ERR_STALE, NFS3ERR_BADHANDLE, NFS3ERR_IO
+ */
+static int
+nfsv3_read_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, uint32_t count, struct nfs_read_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint32_t value_follows;
+    uint8_t buf[RPC_BUFSIZE_SMALL];
+    uint8_t *recvbuf;
+    uint8_t *end;
+    uint32_t buflen;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
+
+/* READ call footer: offset(8) + count(4) = 12 bytes */
+#define READ_CALL_FOOTER_SIZE (8 + XDR_UNIT)
+
+    size_t overhead;
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += READ_CALL_FOOTER_SIZE;
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_READ);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, fh);
+
+    /* Build footer with alignment-safe writes */
+    xdr_put_u64(pt, offset);
+    pt += 8;
+    xdr_put_u32(pt, count);
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    /*
+     * Allocate receive buffer with overflow protection.
+     * NFSv3 READ reply: rpc_nfsreply_hdr + attr_follows(4) + [fattr] +
+     *                   count(4) + eof(4) + data_len(4) + data
+     */
+    overhead = sizeof(struct rpc_nfsreply_hdr) + XDR_UNIT /* attributes_follow */
+        + sizeof(struct nfsv3_fattr)                      /* optional, but allocate */
+        + XDR_UNIT                                        /* count */
+        + XDR_UNIT                                        /* eof */
+        + XDR_UNIT;                                       /* data length */
+    /* Check for XDR_ALIGN overflow (count + 3 must not wrap in 32-bit) */
+    if (count > UINT32_MAX - (XDR_UNIT - 1)) {
+        errno = EINVAL;
+        rpc_unlock(ctx);
+        return -1;
+    }
+    if (count > SIZE_MAX - overhead - (XDR_UNIT - 1)) { /* for ALIGN padding */
+        errno = EINVAL;
+        rpc_unlock(ctx);
+        return -1;
+    }
+    buflen = overhead + XDR_ALIGN(count);
+
+    if ((recvbuf = malloc(buflen)) == NULL) {
+        errno = ENOMEM;
+        rpc_unlock(ctx);
+        return -1;
+    }
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, recvbuf, buflen, xid)) < 0) {
+        free(recvbuf);
+        return -1;
+    }
+
+    reply = (struct rpc_nfsreply_hdr *)recvbuf;
+    RPC_CHECK_REPLY_FREE(ctx, reply, n, recvbuf);
+
+    NFS_CHECK_STATUS_EX(ctx, reply, free(recvbuf));
+
+    pt = recvbuf + sizeof(struct rpc_nfsreply_hdr);
+    end = recvbuf + n;
+
+    /* Attributes (optional) */
+    if (pt + XDR_UNIT > end)
+        goto short_reply;
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows == 1) {
+        if (pt + sizeof(struct nfsv3_fattr) > end)
+            goto short_reply;
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
+
+    /* Count */
+    if (pt + XDR_UNIT > end)
+        goto short_reply;
+    out->count = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+
+    /* EOF */
+    if (pt + XDR_UNIT > end)
+        goto short_reply;
+    out->eof = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+
+    /* Data length and pointer */
+    if (pt + XDR_UNIT > end)
+        goto short_reply;
+    pt += XDR_UNIT; /* skip length field, use count */
+
+    /* Validate that data fits in buffer (use subtraction to avoid pointer overflow) */
+    if (out->count > (size_t)(end - pt))
+        goto short_reply;
+    out->data = pt;
+    out->buf = recvbuf; /* caller must free */
+
+    return 0;
+
+short_reply:
+    free(recvbuf);
+    errno = EIO;
+    return -1;
+}
+
+/*
+ * NFSv3 WRITE (Procedure 7)
+ *
+ * RFC 1813 Section 3.3.7 - NFSPROC3_WRITE
+ *
+ * Writes data to file with configurable stability:
+ *   UNSTABLE (0)  - Server may cache; must COMMIT before assuming durable
+ *   DATA_SYNC (1) - Data on stable storage, metadata may be cached
+ *   FILE_SYNC (2) - All data and metadata on stable storage (slowest)
+ *
+ * Returns 'committed' indicating actual stability level achieved.
+ * Returns 'verf' (write verifier) for detecting server reboots between
+ * UNSTABLE writes and COMMIT. This implementation uses FILE_SYNC.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_ACCES, NFS3ERR_INVAL, NFS3ERR_FBIG,
+ *               NFS3ERR_NOSPC, NFS3ERR_DQUOT, NFS3ERR_ROFS, NFS3ERR_STALE
+ */
+static int
+nfsv3_write_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, const uint8_t *data, uint32_t count,
+    struct nfs_write_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_SMALL];
+    uint8_t *end;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
+
+/* WRITE call footer: offset(8) + count(4) + stable(4) + datalen(4) = 20 bytes */
+#define WRITE_CALL_FOOTER_SIZE (8 + 3 * XDR_UNIT)
+
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+
+    /* Check for XDR_ALIGN overflow before calculating total length */
+    if (count > UINT32_MAX - (XDR_UNIT - 1)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += WRITE_CALL_FOOTER_SIZE;
+    totlen += XDR_ALIGN(count);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_WRITE);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, fh);
+
+    /* Build footer with alignment-safe writes */
+    xdr_put_u64(pt, offset);
+    pt += 8;
+    xdr_put_u32(pt, count);
+    pt += XDR_UNIT;
+    xdr_put_u32(pt, NFS_FILE_SYNC);
+    pt += XDR_UNIT;
+    xdr_put_u32(pt, count); /* datalen */
+    pt += XDR_UNIT;
+
+    memcpy(pt, data, count);
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    /* Parse response if caller wants it */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
+
+        /* WCC data: pre_op_attr (skip) + post_op_attr */
+        pt = nfsv3_parse_wcc_data(pt, end, &out->attr, &out->has_attr);
+        if (pt == NULL)
+            goto done;
+
+        /* count + committed + verf */
+        if (pt + XDR_UNIT + XDR_UNIT + sizeof(uint64_t) > end)
+            goto done;
+        out->count = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        out->committed = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        /*
+         * Write verifier: OPAQUE 8-byte value (RFC 1813).
+         * WARNING: Do NOT byte-swap - opaque values must be compared as raw bytes.
+         */
+        memcpy(&out->verifier, pt, sizeof(out->verifier));
+    }
+
+done:
+    return 0;
+}
+
+/*
+ * NFSv3 CREATE (Procedure 8)
+ *
+ * RFC 1813 Section 3.3.8 - NFSPROC3_CREATE
+ *
+ * Creates a regular file with three modes:
+ *   UNCHECKED (0) - Create or truncate if exists (O_CREAT|O_TRUNC)
+ *   GUARDED (1)   - Fail if exists (O_CREAT|O_EXCL)
+ *   EXCLUSIVE (2) - Atomic create using createverf; for lock files
+ *
+ * Wire format (RFC 1813):
+ *   union createhow3 switch (createmode3 mode) {
+ *   case UNCHECKED:
+ *   case GUARDED:
+ *       sattr3 obj_attributes;
+ *   case EXCLUSIVE:
+ *       createverf3 verf;   (8 bytes)
+ *   };
+ *
+ * EXCLUSIVE mode: createverf is stored in file and returned on success.
+ * If file exists with matching verf, returns success (idempotent retry).
+ *
+ * Status codes: NFS3_OK, NFS3ERR_ACCES, NFS3ERR_EXIST (GUARDED),
+ *               NFS3ERR_NOSPC, NFS3ERR_DQUOT, NFS3ERR_ROFS, NFS3ERR_STALE
+ */
+static int
+nfsv3_create_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, uint32_t mode, int create_mode,
+    struct nfs_create_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint32_t value_follows;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt;
+    uint8_t *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    size_t namelen = strlen(name);
+
+    if (namelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+    totlen += XDR_UNIT; /* create mode */
+
+    /* EXCLUSIVE uses 8-byte verifier, others use sattr3 */
+    if (create_mode == NFS_CREATE_EXCLUSIVE)
+        totlen += 8; /* createverf3 */
+    else
+        totlen += NFSV3_SATTR3_MODE_SIZE;
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_CREATE);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+
+    /* Create mode */
+    pt = xdr_build_u32(pt, create_mode);
+
+    if (create_mode == NFS_CREATE_EXCLUSIVE) {
+        /*
+         * Create verifier: OPAQUE 8-byte value (RFC 1813).
+         * We generate it from time+random; server stores it and returns
+         * it on successful exclusive create for idempotent retry detection.
+         */
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        pt = xdr_build_u32(pt, (uint32_t)tv.tv_sec);
+        pt = xdr_build_u32(pt, (uint32_t)rand());
+    } else {
+        /* UNCHECKED or GUARDED: send sattr3 */
+        pt = nfsv3_build_sattr3_mode(pt, mode);
+    }
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* File handle (optional) */
+    if (pt + XDR_UNIT > end) {
+        errno = EBADMSG;
+        return -1;
+    }
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows == 1) {
+        pt = nfsv3_parse_fh(pt, end, &out->fh);
+        if (pt == NULL) {
+            errno = EBADMSG;
+            return -1;
+        }
+        out->has_fh = 1;
+    }
+
+    /* Object attributes (optional) */
+    pt = nfsv3_parse_post_op_attr(pt, end, &out->attr, &out->has_attr);
+    if (pt == NULL) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    (void)pt; /* Silence unused warning - end of parsing */
+    return 0;
+}
+
+/*
+ * Common implementation for REMOVE (procedure 12) and RMDIR (procedure 13).
+ *
+ * RFC 1813 Section 3.3.12 (REMOVE) and 3.3.13 (RMDIR)
+ *
+ * Both return wcc_data (weak cache consistency) for the directory:
+ *   pre_op_attr: size, mtime, ctime before operation
+ *   post_op_attr: full attributes after operation
+ *
+ * REMOVE: NFS3ERR_ISDIR if target is directory
+ * RMDIR: NFS3ERR_NOTDIR if target is not directory, NFS3ERR_NOTEMPTY if not empty
+ */
+static int
+nfsv3_unlink_common(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, uint32_t proc, struct nfs_wcc_data *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    uint8_t *end;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+    size_t namelen = strlen(name);
+
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+
+    if (namelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, proc);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    /* Parse wcc_data for directory */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
+
+        /* pre_op_attr (skip) */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + 24 <= end)
+                pt += 24; /* size(8) + mtime(8) + ctime(8) */
+        }
+
+        /* post_op_attr */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->dir_attr);
+                out->has_dir_attr = 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * NFSv3 REMOVE (Procedure 12)
+ */
+static int
+nfsv3_remove_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, struct nfs_wcc_data *out)
+{
+    return nfsv3_unlink_common(ctx, dirfh, name, NFSV3_PROC_REMOVE, out);
+}
+
+/*
+ * NFSv3 RENAME (Procedure 14)
+ */
+static int
+nfsv3_rename_impl(struct nfsctx *ctx, const struct nfs_fh *srcfh,
+    const char *srcname, const struct nfs_fh *dstfh, const char *dstname,
+    struct nfs_rename_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    uint8_t *end;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+    size_t srcnamelen = strlen(srcname);
+    size_t dstnamelen = strlen(dstname);
+
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+
+    if (srcnamelen > NFS_MAXNAMLEN || dstnamelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(srcfh->len);
+    totlen += XDR_VARLEN(srcnamelen);
+    totlen += XDR_VARLEN(dstfh->len);
+    totlen += XDR_VARLEN(dstnamelen);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_RENAME);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, srcfh);
+    pt = nfsv3_build_string(pt, srcname);
+    pt = nfsv3_build_fh(pt, dstfh);
+    pt = nfsv3_build_string(pt, dstname);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    /* Parse wcc_data for both directories */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
+
+        /* Source directory wcc_data */
+        /* pre_op_attr (skip) */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + 24 <= end)
+                pt += 24;
+        }
+        /* post_op_attr */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->src_dir_attr);
+                out->has_src_dir_attr = 1;
+                pt += sizeof(struct nfsv3_fattr);
+            }
+        }
+
+        /* Destination directory wcc_data */
+        /* pre_op_attr (skip) */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + 24 <= end)
+                pt += 24;
+        }
+        /* post_op_attr */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->dst_dir_attr);
+                out->has_dst_dir_attr = 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * NFSv3 LINK (Procedure 15)
+ */
+static int
+nfsv3_link_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    const struct nfs_fh *dirfh, const char *name, struct nfs_link_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[IOBUFSIZE * 2];
+    uint8_t *end;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+    size_t namelen = strlen(name);
+
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+
+    if (namelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_LINK);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, fh);
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    /* Parse file post_op_attr and directory wcc_data */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
+
+        /* File post_op_attr (nlink changed) */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->file_attr);
+                out->has_file_attr = 1;
+                pt += sizeof(struct nfsv3_fattr);
+            }
+        }
+
+        /* Directory wcc_data */
+        /* pre_op_attr (skip) */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + 24 <= end)
+                pt += 24;
+        }
+        /* post_op_attr */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->dir_attr);
+                out->has_dir_attr = 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * NFSv3 SYMLINK (Procedure 10)
+ */
+static int
+nfsv3_symlink_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, const char *target, uint32_t mode,
+    struct nfs_symlink_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[IOBUFSIZE * 2];
+    uint8_t *end;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+    size_t namelen = strlen(name);
+    size_t targetlen = strlen(target);
+
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
+
+    if (namelen > NFS_MAXNAMLEN || targetlen > NFS_MAXPATHLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+    totlen += NFSV3_SATTR3_MODE_SIZE;
+    totlen += XDR_VARLEN(targetlen);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_SYMLINK);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+
+    /* Attributes */
+    pt = nfsv3_build_sattr3_mode(pt, mode);
+
+    pt = nfsv3_build_string(pt, target);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    /* Parse symlink result */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
+
+        /* post_op_fh3 for symlink */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + XDR_UNIT <= end) {
+                uint32_t fhlen = xdr_get_u32(pt);
+                pt += XDR_UNIT;
+                if (fhlen <= NFS_FHSIZE_MAX && pt + XDR_ALIGN(fhlen) <= end) {
+                    out->fh.len = fhlen;
+                    memcpy(out->fh.data, pt, fhlen);
+                    out->has_fh = 1;
+                    pt += XDR_ALIGN(fhlen);
+                }
+            }
+        }
+
+        /* post_op_attr for symlink */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+                out->has_attr = 1;
+                pt += sizeof(struct nfsv3_fattr);
+            }
+        }
+
+        /* Directory wcc_data */
+        /* pre_op_attr (skip) */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + 24 <= end)
+                pt += 24;
+        }
+        /* post_op_attr */
+        if (pt + XDR_UNIT <= end) {
+            value_follows = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+            if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+                nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->dir_attr);
+                out->has_dir_attr = 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * NFSv3 MKDIR (Procedure 9)
+ */
+static int
+nfsv3_mkdir_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, uint32_t mode, struct nfs_create_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint32_t value_follows;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt;
+    uint8_t *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    size_t namelen = strlen(name);
+
+    if (namelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+    totlen += NFSV3_SATTR3_MODE_SIZE;
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_MKDIR);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+
+    /* Attributes */
+    pt = nfsv3_build_sattr3_mode(pt, mode);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* File handle (optional) */
+    if (pt + XDR_UNIT > end) {
+        errno = EBADMSG;
+        return -1;
+    }
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows == 1) {
+        pt = nfsv3_parse_fh(pt, end, &out->fh);
+        if (pt == NULL) {
+            errno = EBADMSG;
+            return -1;
+        }
+        out->has_fh = 1;
+    }
+
+    /* Object attributes (optional) */
+    pt = nfsv3_parse_post_op_attr(pt, end, &out->attr, &out->has_attr);
+    if (pt == NULL) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    (void)pt; /* Silence unused warning - end of parsing */
+    return 0;
+}
+
+/*
+ * NFSv3 RMDIR (Procedure 13)
+ */
+static int
+nfsv3_rmdir_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, struct nfs_wcc_data *out)
+{
+    return nfsv3_unlink_common(ctx, dirfh, name, NFSV3_PROC_RMDIR, out);
+}
+
+/*
+ * NFSv3 READDIR (Procedure 16)
+ */
+static int
+nfsv3_readdir_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_dir *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+
+/* READDIR call footer: cookie(8) + cookieverf(8) + count(4) = 20 bytes */
+#define READDIR_CALL_FOOTER_SIZE (8 + 8 + XDR_UNIT)
+
+    uint8_t *buf;
+    size_t bufsize = IOBUFSIZE * 2;
+    size_t totlen;
+    uint8_t *pt, *end;
+    uint32_t value_follows;
+    uint64_t verifier;
+    uint64_t cookie;
+    uint64_t prev_cookie;
+    size_t prev_count;
+    ssize_t n;
+    uint32_t xid;
+
+    nfs_dir_init(out);
+    verifier = 0;
+    cookie = 0;
+    prev_cookie = 0;
+
+    buf = malloc(bufsize);
+    if (buf == NULL)
+        return -1;
 
 call_again:
-	calls++;
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+    prev_count = out->count;
+    xid = rand();
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += READDIR_CALL_FOOTER_SIZE;
 
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(fhlen, 4);
-	totlen += sizeof(struct readdir_call_footer);
+    if (totlen > bufsize) {
+        free(buf);
+        errno = ENOBUFS;
+        nfs_dir_free(out);
+        return -1;
+    }
 
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, " ** Error: Total length exceeds buffer\n");
-		return -1;
-	}
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_READDIR);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_READDIR);
+    pt = buf + sizeof(struct rpc_call_hdr);
 
+    pt = nfsv3_build_fh(pt, fh);
 
-	/* File handle */
-	*(uint32_t *)pt = htonl(fhlen);
-	pt += 4;
-	memcpy(pt, fhandle, fhlen);
-	pt += ALIGN(fhlen, 4);
+    /*
+     * Cookie and verifier: OPAQUE 8-byte values (RFC 1813).
+     * WARNING: Do NOT byte-swap - these are echoed back exactly as received.
+     */
+    memcpy(pt, &cookie, sizeof(cookie));
+    pt += 8;
+    memcpy(pt, &verifier, sizeof(verifier));
+    pt += 8;
+    xdr_put_u32(pt, IOBUFSIZE);
 
-	print(1, ctx, "FH len: %u\n", fhlen);
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0) {
+        free(buf);
+        nfs_dir_free(out);
+        return -1;
+    }
 
-	footer = (struct readdir_call_footer *)pt;
-	pt += sizeof(struct readdir_call_footer);
-	footer->cookie = cookie;
-	footer->cookieverf = verifier;
-	footer->count = htonl(IOBUFSIZE);
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, bufsize, xid)) < 0) {
+        free(buf);
+        nfs_dir_free(out);
+        return -1;
+    }
 
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY_FREE(ctx, reply, n, buf);
 
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    NFS_CHECK_STATUS_EX(ctx, reply, { free(buf); nfs_dir_free(out); });
 
-	tot += n;
-	print(1, ctx, "Read %lu bytes of data for READDIR reply\n", n);
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
 
-	/* Dir attributes */
-	if (value_follows) {
-		//struct entattr *dirattr;	
-		//dirattr = (struct entattr *)pt;
-		pt += sizeof(struct entattr);
-	}
+    /* Dir attributes (optional) - need 4 bytes for value_follows */
+    if (pt + XDR_UNIT > end) {
+        free(buf);
+        errno = EBADMSG;
+        nfs_dir_free(out);
+        return -1;
+    }
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows) {
+        if (pt + sizeof(struct nfsv3_fattr) > end) {
+            free(buf);
+            errno = EBADMSG;
+            nfs_dir_free(out);
+            return -1;
+        }
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->dir_attr);
+        out->has_dir_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
 
-	/* Prepare for next call */
-	verifier = *(uint64_t *)pt;
-	pt += 8;
+    /*
+     * Cookie verifier: OPAQUE 8-byte value (RFC 1813).
+     * WARNING: Do NOT byte-swap - store as-is to echo back in next request.
+     */
+    if (pt + 12 > end) {  /* verifier(8) + value_follows(4) */
+        free(buf);
+        errno = EBADMSG;
+        nfs_dir_free(out);
+        return -1;
+    }
+    memcpy(&verifier, pt, sizeof(verifier));
+    pt += 8;
 
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
+    /* Entries */
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
 
-	/* Traverse all entries */
-	while (value_follows) {
-		uint64_t fid;
-		uint32_t len;
-		char *name;
+    while (value_follows) {
+        struct nfs_dirent ent;
+        uint32_t len, len_padded;
 
-		fid = be64toh(*(uint64_t *)pt);
-		pt += 8;
+        /* Prevent unbounded allocation from malicious server */
+        if (out->count >= NFS_READDIR_MAX_ENTRIES) {
+            fprintf(stderr, "** Error: Too many directory entries (max %d)\n",
+                NFS_READDIR_MAX_ENTRIES);
+            free(buf);
+            nfs_dir_free(out);
+            errno = EOVERFLOW;
+            return -1;
+        }
 
-		len = ntohl(*(uint32_t *)pt);
-		pt += 4;
+        memset(&ent, 0, sizeof(ent));
 
-		name = (char *)pt;
-		pt += ALIGN(len, 4);
+        /* Need at least: fileid(8) + namelen(4) */
+        if (pt + 12 > end) {
+            free(buf);
+            errno = EBADMSG;
+            nfs_dir_free(out);
+            return -1;
+        }
 
-		printf("FID:%016lx ", fid);
-		fwrite(name, len, 1, stdout);
-		printf("\n");
+        /* File ID (use memcpy for safe unaligned access) */
+        memcpy(&ent.fileid, pt, sizeof(ent.fileid));
+        ent.fileid = be64toh(ent.fileid);
+        pt += 8;
 
-		cookie = *(uint64_t *)pt;
-		pt += 8;
+        /* Name length */
+        len = xdr_get_u32(pt);
+        pt += XDR_UNIT;
 
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-	}
+        /* Validate name length BEFORE XDR_ALIGN to prevent overflow */
+        if (len > NFS_MAXNAMLEN) {
+            free(buf);
+            errno = EBADMSG;
+            nfs_dir_free(out);
+            return -1;
+        }
+        len_padded = XDR_ALIGN(len);
 
-	eof = ntohl(*(uint32_t *)pt);
-	pt += 4;
+        /* Need room for: name_data + cookie(8) + value_follows(4) */
+        if (pt + len_padded + sizeof(uint64_t) + XDR_UNIT > end) {
+            free(buf);
+            errno = EBADMSG;
+            nfs_dir_free(out);
+            return -1;
+        }
 
-	/* Run another call to get the rest entries */
-	if (eof != 1) {
-		print(1, ctx, "EOF != 1, running call %lu\n", calls+1);
-		goto call_again;
-	}
+        memcpy(ent.name, pt, len);
+        ent.name[len] = '\0';
+        xdr_sanitize_string(ent.name);
+        pt += len_padded;
 
-	print(1, ctx, "Transfered %lu bytes in %lu calls\n", tot, calls);
-	return 0;
+        /*
+         * Cookie: OPAQUE 8-byte value (RFC 1813).
+         * WARNING: Do NOT byte-swap - used for pagination, echoed back as-is.
+         */
+        memcpy(&ent.cookie, pt, sizeof(ent.cookie));
+        cookie = ent.cookie;
+        pt += sizeof(uint64_t);
+
+        if (nfs_dir_add(out, &ent) < 0) {
+            free(buf);
+            nfs_dir_free(out);
+            return -1;
+        }
+
+        value_follows = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+    }
+
+    /* EOF - need 4 bytes */
+    if (pt + XDR_UNIT > end) {
+        free(buf);
+        errno = EBADMSG;
+        nfs_dir_free(out);
+        return -1;
+    }
+    out->eof = xdr_get_u32(pt);
+
+    if (!out->eof) {
+        /*
+         * Detect cookie stall from malicious server.
+         * If we got entries but cookie didn't change, server is looping us.
+         * If we got no entries and cookie didn't change, also stuck.
+         */
+        if (out->count > prev_count && cookie == prev_cookie) {
+            /* Got entries but cookie unchanged - server is broken/malicious */
+            free(buf);
+            errno = ELOOP;
+            nfs_dir_free(out);
+            return -1;
+        }
+        if (out->count == prev_count) {
+            /* Got no new entries - treat as stall */
+            free(buf);
+            errno = ELOOP;
+            nfs_dir_free(out);
+            return -1;
+        }
+        prev_cookie = cookie;
+        goto call_again;
+    }
+
+    free(buf);
+    return 0;
 }
 
 /*
- * Do MKNOD Call for character och block device files
+ * NFSv3 READDIRPLUS (Procedure 17)
+ *
+ * RFC 1813 Section 3.3.17 - NFSPROC3_READDIRPLUS
+ *
+ * Returns entries with file handles and attributes (N+1 RPCs -> ~1 RPC).
+ * Some servers may omit fh/attr for entries they can't provide efficiently.
+ *
+ * dircount: max bytes of directory data (names/cookies)
+ * maxcount: max total reply size including attributes
+ *
+ * cookieverf: Server sets on first call, client echoes on subsequent.
+ * If directory modified, server may return NFS3ERR_BAD_COOKIE.
+ *
+ * Note: READDIRPLUS may fail on very large directories due to UDP size.
  */
-int
-nfsv3_mknod_dev(struct nfsctx *ctx, struct nfsv3_mknod_dev_args *args)
+static int
+nfsv3_readdirplus_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_dir *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	struct setattr *attr;
-	size_t totlen;
-	uint8_t buf[IOBUFSIZE*2];
-	uint32_t xid;
-	uint8_t *pt;
-	uint32_t *len;
-	ssize_t n;
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
 
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+/* READDIRPLUS call footer: cookie(8) + verifier(8) + dircount(4) + maxcount(4) = 24 bytes */
+#define READDIRPLUS_CALL_FOOTER_SIZE (8 + 8 + 2 * XDR_UNIT)
+#define READDIRPLUS_BUFSIZE          (IOBUFSIZE * 10)
 
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(args->fhlen, 4);
-	totlen += 4 + ALIGN(strlen(args->name), 4);
-	totlen += 4;
-	totlen += sizeof(struct setattr);
-	totlen += 4 + 4; /* Major minor */
+    uint8_t *buf;
+    size_t totlen;
+    uint8_t *pt, *end;
+    uint32_t value_follows;
+    uint64_t verifier;
+    uint64_t cookie;
+    uint64_t prev_cookie;
+    size_t prev_count;
+    ssize_t n;
+    uint32_t xid;
+    int ret = -1;
 
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, "** Error: total length exceeds buffer\n");
-		return -1;
-	}
+    nfs_dir_init(out);
+    verifier = 0;
+    cookie = 0;
+    prev_cookie = 0;
 
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_MKNOD);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    buf = malloc(READDIRPLUS_BUFSIZE);
+    if (buf == NULL)
+        return -1;
 
-	if (strlen(args->name) > NAMEMAXLEN) {
-		print(0, ctx, "** Error: src name exceeds %s bytes\n", NAMEMAXLEN);
-		errno = ENOBUFS;
-		return -1;
-	}
+call_again:
+    prev_count = out->count;
+    xid = rand();
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += READDIRPLUS_CALL_FOOTER_SIZE;
 
-	/* Directory fh */
-	len = (uint32_t *)pt;
-	*len = htonl(ALIGN(args->fhlen, 4));
-	pt += 4;
-	memcpy(pt, args->fh, args->fhlen);
-	pt += ALIGN(args->fhlen, 4);
+    if (totlen > READDIRPLUS_BUFSIZE) {
+        errno = ENOBUFS;
+        goto cleanup;
+    }
 
-	/* Name */
-	len = (uint32_t *)pt;
-	*len = htonl(strlen(args->name));
-	pt += 4;
-	memcpy(pt, args->name, strlen(args->name));
-	pt += ALIGN(strlen(args->name), 4);
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_READDIRPLUS);
+    pt = buf + sizeof(struct rpc_call_hdr);
 
-	/* Type */
-	*(uint32_t *)pt = htonl(args->type);
-	pt += 4;
+    pt = nfsv3_build_fh(pt, fh);
 
-	/* Attributes, we just set mode for now */
-	attr = (struct setattr *)pt;
-	pt += sizeof(struct setattr);
-	attr->mode_value_follows = htonl(1);
-	attr->mode = htonl(args->mode);
+    /*
+     * Cookie and verifier: OPAQUE 8-byte values (RFC 1813).
+     * WARNING: Do NOT byte-swap - these are echoed back exactly as received.
+     */
+    memcpy(pt, &cookie, sizeof(cookie));
+    pt += 8;
+    memcpy(pt, &verifier, sizeof(verifier));
+    pt += 8;
+    xdr_put_u32(pt, IOBUFSIZE / 2); /* dircount */
+    pt += XDR_UNIT;
+    xdr_put_u32(pt, IOBUFSIZE);     /* maxcount */
 
-	/* Major */
-	*(uint32_t *)pt = htonl(args->major);
-	pt += 4;
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        goto cleanup;
 
-	/* Minor */
-	*(uint32_t *)pt = htonl(args->minor);
-	pt += 4;
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf,
+             READDIRPLUS_BUFSIZE, xid)) < 0)
+        goto cleanup;
 
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY_EX(ctx, reply, n, 1, { free(buf); nfs_dir_free(out); });
 
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
+    NFS_CHECK_STATUS_EX(ctx, reply, { free(buf); nfs_dir_free(out); });
 
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
 
-	/* Attributes follow */
+    /* Dir attributes (optional) - need 4 bytes for value_follows */
+    if (pt + XDR_UNIT > end) {
+        errno = EBADMSG;
+        goto cleanup;
+    }
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows) {
+        if (pt + sizeof(struct nfsv3_fattr) > end) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->dir_attr);
+        out->has_dir_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
 
-	return 0;
+    /*
+     * Cookie verifier: OPAQUE 8-byte value (RFC 1813).
+     * WARNING: Do NOT byte-swap - store as-is to echo back in next request.
+     */
+    if (pt + 12 > end) {  /* verifier(8) + value_follows(4) */
+        errno = EBADMSG;
+        goto cleanup;
+    }
+    memcpy(&verifier, pt, sizeof(verifier));
+    pt += 8;
+
+    /* Entries */
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+
+    while (value_follows) {
+        struct nfs_dirent ent;
+        uint32_t len, len_padded;
+
+        /* Prevent unbounded allocation from malicious server */
+        if (out->count >= NFS_READDIR_MAX_ENTRIES) {
+            fprintf(stderr, "** Error: Too many directory entries (max %d)\n",
+                NFS_READDIR_MAX_ENTRIES);
+            errno = EOVERFLOW;
+            goto cleanup;
+        }
+
+        memset(&ent, 0, sizeof(ent));
+
+        /* Need at least: fileid(8) + namelen(4) */
+        if (pt + 12 > end) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+
+        /* File ID (use memcpy for safe unaligned access) */
+        memcpy(&ent.fileid, pt, sizeof(ent.fileid));
+        ent.fileid = be64toh(ent.fileid);
+        pt += 8;
+
+        /* Name length */
+        len = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+
+        /* Validate name length BEFORE XDR_ALIGN to prevent overflow */
+        if (len > NFS_MAXNAMLEN) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+        len_padded = XDR_ALIGN(len);
+
+        /* Bounds check after alignment: name_data + cookie(8) + value_follows(4) */
+        if (pt + len_padded + sizeof(uint64_t) + XDR_UNIT > end) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+
+        memcpy(ent.name, pt, len);
+        ent.name[len] = '\0';
+        xdr_sanitize_string(ent.name);
+        pt += len_padded;
+
+        /*
+         * Cookie: OPAQUE 8-byte value (RFC 1813).
+         * WARNING: Do NOT byte-swap - used for pagination, echoed back as-is.
+         */
+        memcpy(&ent.cookie, pt, sizeof(ent.cookie));
+        cookie = ent.cookie;
+        pt += 8;
+
+        /* Name attributes (optional) */
+        if (pt + XDR_UNIT > end) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+        value_follows = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        if (value_follows == 1) {
+            if (pt + sizeof(struct nfsv3_fattr) > end) {
+                errno = EBADMSG;
+                goto cleanup;
+            }
+            nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &ent.attr);
+            ent.has_attr = 1;
+            pt += sizeof(struct nfsv3_fattr);
+        }
+
+        /* File handle (optional) - need at least 4 bytes for value_follows */
+        if (pt + XDR_UNIT > end) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+        value_follows = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        if (value_follows == 1) {
+            /* Need 4 bytes for fh length */
+            if (pt + XDR_UNIT > end) {
+                errno = EBADMSG;
+                goto cleanup;
+            }
+            len = xdr_get_u32(pt);
+            pt += XDR_UNIT;
+
+            /* Validate FH length BEFORE XDR_ALIGN to prevent overflow
+             * Note: reject zero-length FH as invalid */
+            if (len == 0 || len > NFS_FHSIZE_MAX) {
+                errno = EBADMSG;
+                goto cleanup;
+            }
+            len_padded = XDR_ALIGN(len);
+
+            /* Check bounds after alignment */
+            if (pt + len_padded > end) {
+                errno = EBADMSG;
+                goto cleanup;
+            }
+
+            nfs_fh_from_buf(&ent.fh, pt, len);
+            ent.has_fh = 1;
+            pt += len_padded;
+        }
+
+        if (nfs_dir_add(out, &ent) < 0)
+            goto cleanup;
+
+        /* Need 4 bytes for next value_follows */
+        if (pt + XDR_UNIT > end) {
+            errno = EBADMSG;
+            goto cleanup;
+        }
+        value_follows = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+    }
+
+    /* EOF - need 4 bytes */
+    if (pt + XDR_UNIT > end) {
+        errno = EBADMSG;
+        goto cleanup;
+    }
+    out->eof = xdr_get_u32(pt);
+
+    if (!out->eof) {
+        /* Detect malicious server returning same cookie forever */
+        if (out->count > prev_count && cookie == prev_cookie) {
+            errno = ELOOP;
+            goto cleanup;
+        }
+        /* No new entries means we're stuck */
+        if (out->count == prev_count) {
+            errno = ELOOP;
+            goto cleanup;
+        }
+        prev_cookie = cookie;
+        goto call_again;
+    }
+
+    ret = 0;
+
+cleanup:
+    free(buf);
+    if (ret < 0)
+        nfs_dir_free(out);
+    return ret;
 }
 
 /*
- * Initialize a readdirplus call structure for subsequent queries that
- * will return next entry in directory.
+ * NFSv3 MKNOD (Procedure 11)
+ *
+ * RFC 1813 Section 3.3.11 - NFSPROC3_MKNOD
+ *
+ * Creates special files (no NFSv2 equivalent):
+ *   NF3CHR (2)  - Character device (uses specdata3: major/minor)
+ *   NF3BLK (3)  - Block device (uses specdata3: major/minor)
+ *   NF3SOCK (5) - Unix domain socket (specdata ignored)
+ *   NF3FIFO (6) - Named pipe/FIFO (specdata ignored)
+ *
+ * Creating device nodes typically requires root privileges on server.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3ERR_NOSPC,
+ *               NFS3ERR_DQUOT, NFS3ERR_ROFS, NFS3ERR_NOTSUPP
+ */
+static int
+nfsv3_mknod_impl(struct nfsctx *ctx, const struct nfs_fh *dirfh,
+    const char *name, int type, uint32_t mode,
+    uint32_t major, uint32_t minor, struct nfs_create_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint32_t value_follows;
+    uint8_t *buf;
+    size_t bufsize = IOBUFSIZE * 2;
+    size_t totlen;
+    uint8_t *pt;
+    uint8_t *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    size_t namelen = strlen(name);
+
+    if (namelen > NFS_MAXNAMLEN) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(dirfh->len);
+    totlen += XDR_VARLEN(namelen);
+    totlen += XDR_UNIT; /* type */
+    totlen += NFSV3_SATTR3_MODE_SIZE;
+    /* RFC 1813: major/minor (specdata3) only for CHR and BLK devices */
+    if (type == NFS_FTYPE_CHR || type == NFS_FTYPE_BLK)
+        totlen += XDR_UNIT + XDR_UNIT; /* major/minor */
+
+    if (totlen > bufsize) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    buf = malloc(bufsize);
+    if (buf == NULL)
+        return -1;
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_MKNOD);
+    pt = buf + sizeof(struct rpc_call_hdr);
+
+    pt = nfsv3_build_fh(pt, dirfh);
+    pt = nfsv3_build_string(pt, name);
+
+    /* Type */
+    pt = xdr_build_u32(pt, type);
+
+    /* Attributes */
+    pt = nfsv3_build_sattr3_mode(pt, mode);
+
+    /* RFC 1813: major/minor (specdata3) only for CHR and BLK devices */
+    if (type == NFS_FTYPE_CHR || type == NFS_FTYPE_BLK) {
+        pt = xdr_build_u32(pt, major);
+        pt = xdr_build_u32(pt, minor);
+    }
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0) {
+        free(buf);
+        return -1;
+    }
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, bufsize, xid)) < 0) {
+        free(buf);
+        return -1;
+    }
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY_FREE(ctx, reply, n, buf);
+
+    NFS_CHECK_STATUS_EX(ctx, reply, free(buf));
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* File handle (optional) */
+    if (pt + XDR_UNIT > end) {
+        free(buf);
+        errno = EBADMSG;
+        return -1;
+    }
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows == 1) {
+        pt = nfsv3_parse_fh(pt, end, &out->fh);
+        if (pt == NULL) {
+            free(buf);
+            errno = EBADMSG;
+            return -1;
+        }
+        out->has_fh = 1;
+    }
+
+    /* Object attributes (optional) */
+    if (pt + XDR_UNIT > end) {
+        free(buf);
+        errno = EBADMSG;
+        return -1;
+    }
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows == 1) {
+        if (pt + sizeof(struct nfsv3_fattr) > end) {
+            free(buf);
+            errno = EBADMSG;
+            return -1;
+        }
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+    }
+
+    free(buf);
+    return 0;
+}
+
+/*
+ * NFSv3 FSSTAT (Procedure 18)
+ *
+ * RFC 1813 Section 3.3.18 - NFSPROC3_FSSTAT
+ *
+ * Returns dynamic filesystem information (space usage, file counts).
+ * Used for df-like operations.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_IO, NFS3ERR_STALE, NFS3ERR_BADHANDLE,
+ *               NFS3ERR_SERVERFAULT
+ */
+static int
+nfsv3_fsstat_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_fsstat_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt, *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+
+    totlen = sizeof(struct rpc_call_hdr) + XDR_VARLEN(fh->len);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_FSSTAT);
+    pt = buf + sizeof(struct rpc_call_hdr);
+    pt = nfsv3_build_fh(pt, fh);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* Post-op attributes (optional) */
+    if (pt + XDR_UNIT > end)
+        return 0;
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
+
+    /* FSSTAT3resok: tbytes, fbytes, abytes, tfiles, ffiles, afiles (6 uint64), invarsec (uint32) */
+    if (pt + 6 * sizeof(uint64_t) + XDR_UNIT > end) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    out->tbytes = xdr_get_u64(pt);
+    pt += 8;
+    out->fbytes = xdr_get_u64(pt);
+    pt += 8;
+    out->abytes = xdr_get_u64(pt);
+    pt += 8;
+    out->tfiles = xdr_get_u64(pt);
+    pt += 8;
+    out->ffiles = xdr_get_u64(pt);
+    pt += 8;
+    out->afiles = xdr_get_u64(pt);
+    pt += 8;
+    out->invarsec = xdr_get_u32(pt);
+
+    /* v3 doesn't use block-based values */
+    out->bsize = 0;
+    out->tsize = 0;
+    out->blocks = 0;
+    out->bfree = 0;
+    out->bavail = 0;
+
+    return 0;
+}
+
+/*
+ * NFSv3 FSINFO (Procedure 19)
+ *
+ * RFC 1813 Section 3.3.19 - NFSPROC3_FSINFO
+ *
+ * Returns static filesystem information (max sizes, capabilities).
+ * Used for client configuration (optimal read/write sizes).
+ *
+ * Status codes: NFS3_OK, NFS3ERR_STALE, NFS3ERR_BADHANDLE, NFS3ERR_SERVERFAULT
+ */
+static int
+nfsv3_fsinfo_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_fsinfo_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt, *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+
+    totlen = sizeof(struct rpc_call_hdr) + XDR_VARLEN(fh->len);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_FSINFO);
+    pt = buf + sizeof(struct rpc_call_hdr);
+    pt = nfsv3_build_fh(pt, fh);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* Post-op attributes (optional) */
+    if (pt + XDR_UNIT > end)
+        return 0;
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
+
+    /* FSINFO3resok: 7 * uint32 + size3 + time + uint32 = 7*4 + 8 + 8 + 4 = 48 bytes */
+    if (pt + 48 > end) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    out->rtmax = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->rtpref = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->rtmult = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->wtmax = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->wtpref = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->wtmult = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->dtpref = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+
+    /* maxfilesize (size3 = uint64) */
+    out->maxfilesize = xdr_get_u64(pt);
+    pt += 8;
+
+    /* time_delta (nfstime3) */
+    out->time_delta.sec = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->time_delta.nsec = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+
+    /* properties */
+    out->properties = xdr_get_u32(pt);
+
+    return 0;
+}
+
+/*
+ * NFSv3 ACCESS (Procedure 4)
+ *
+ * RFC 1813 Section 3.3.4 - NFSPROC3_ACCESS
+ *
+ * Checks access permissions for a file. More efficient than GETATTR
+ * because server can check actual permissions (ACLs, security labels).
+ *
+ * Status codes: NFS3_OK, NFS3ERR_IO, NFS3ERR_STALE, NFS3ERR_BADHANDLE,
+ *               NFS3ERR_SERVERFAULT
+ */
+static int
+nfsv3_access_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint32_t access_mask, struct nfs_access_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt, *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+
+    totlen = sizeof(struct rpc_call_hdr) + XDR_VARLEN(fh->len) + XDR_UNIT;
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_ACCESS);
+    pt = buf + sizeof(struct rpc_call_hdr);
+    pt = nfsv3_build_fh(pt, fh);
+
+    /* Access mask */
+    pt = xdr_build_u32(pt, access_mask);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* Post-op attributes (optional) */
+    if (pt + XDR_UNIT > end)
+        return 0;
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
+
+    /* Access result */
+    if (pt + XDR_UNIT > end) {
+        errno = EBADMSG;
+        return -1;
+    }
+    out->access = xdr_get_u32(pt);
+
+    return 0;
+}
+
+/*
+ * NFSv3 PATHCONF (Procedure 20)
+ *
+ * RFC 1813 Section 3.3.20 - NFSPROC3_PATHCONF
+ *
+ * Returns POSIX pathconf(2) information for a file.
+ *
+ * Status codes: NFS3_OK, NFS3ERR_STALE, NFS3ERR_BADHANDLE, NFS3ERR_SERVERFAULT
+ */
+static int
+nfsv3_pathconf_impl(struct nfsctx *ctx, const struct nfs_fh *fh,
+    struct nfs_pathconf_res *out)
+{
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    size_t totlen;
+    uint8_t *pt, *end;
+    ssize_t n;
+    uint32_t xid = rand();
+    uint32_t value_follows;
+
+    totlen = sizeof(struct rpc_call_hdr) + XDR_VARLEN(fh->len);
+
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_PATHCONF);
+    pt = buf + sizeof(struct rpc_call_hdr);
+    pt = nfsv3_build_fh(pt, fh);
+    (void)pt;
+
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
+
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
+
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
+
+    NFS_CHECK_STATUS(ctx, reply);
+
+    memset(out, 0, sizeof(*out));
+    pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    end = buf + n;
+
+    /* Post-op attributes (optional) */
+    if (pt + XDR_UNIT > end)
+        return 0;
+    value_follows = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    if (value_follows && pt + sizeof(struct nfsv3_fattr) <= end) {
+        nfsv3_parse_fattr((struct nfsv3_fattr *)pt, &out->attr);
+        out->has_attr = 1;
+        pt += sizeof(struct nfsv3_fattr);
+    }
+
+    /* PATHCONF3resok: linkmax, name_max, 4 bools */
+    if (pt + 6 * XDR_UNIT > end) {
+        errno = EBADMSG;
+        return -1;
+    }
+
+    out->linkmax = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->name_max = xdr_get_u32(pt);
+    pt += XDR_UNIT;
+    out->no_trunc = xdr_get_u32(pt) != 0;
+    pt += XDR_UNIT;
+    out->chown_restricted = xdr_get_u32(pt) != 0;
+    pt += XDR_UNIT;
+    out->case_insensitive = xdr_get_u32(pt) != 0;
+    pt += XDR_UNIT;
+    out->case_preserving = xdr_get_u32(pt) != 0;
+
+    return 0;
+}
+
+/*
+ * NULL - NFSv3 connectivity test.
+ *
+ * RFC 1813 Section 3.3.1 - NFSPROC3_NULL (procedure 0)
+ *
+ * Does nothing. Used to test server availability and measure round-trip time.
  * Returns 0 on success, -1 on error.
  */
 int
-nfsv3_readdirplus_init(struct nfsctx *ctx, 
-	uint8_t *fhandle, uint32_t fhlen, struct dirpluspt *dpt)
+nfsv3_null(struct nfsctx *ctx)
 {
-	memset(dpt, 0x00, sizeof(struct dirpluspt));
-	dpt->cookie = 0;
-	dpt->verifier = 0;
-
-	if (fhlen > sizeof(dpt->fh)) {
-		fprintf(stderr, "** Error: Target file handle buffer too small\n");
-		errno = ENOMEM;
-		return -1;
-	}
-	memcpy(dpt->fh, fhandle, fhlen);
-	dpt->fhlen = fhlen;
-
-	return 0;
+    return rpc_simple_call(ctx, RPC_PROGRAM_NFS, NFS_VERSION_3,
+        RPC_NFS_PROCEDURE_NULL, ctx->ports.nfsd,
+        NULL, 0, NULL, 0, NULL);
 }
 
 /*
- * Read next directory plus entry.
- * Returns 0 and fills the ent structure on success, -1 on error.
- * Returns 1 on eof, if there are no more entries to read;
+ * WRITE with stability mode - Same as nfsv3_write_impl but allows
+ * caller to specify stability level.
+ *
+ * Returns 0 on success, -1 on error.
  */
 int
-nfsv3_readdirplus_next(struct nfsctx *ctx, struct dirpluspt *dpt, struct dirplusent *ent)
+nfsv3_write_stable(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, const uint8_t *data, uint32_t count,
+    int stability, struct nfs_write_res *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[IOBUFSIZE];
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t buf[RPC_BUFSIZE_SMALL];
+    uint8_t *end;
+    size_t totlen;
+    uint8_t *pt;
+    ssize_t n;
+    uint32_t xid = rand();
 
-	uint32_t value_follows;
-	size_t totlen;
-	ssize_t n;
-	uint8_t *pt;
-	uint32_t xid;
+    struct write_call_footer {
+        uint64_t offset;
+        uint32_t count;
+        uint32_t stable;
+        uint32_t datalen;
+    } __attribute__((packed)) * footer;
 
-	uint64_t cookie;
-	uint64_t verifier;
-	
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
 
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(dpt->fhlen, 4);
-	totlen += 8; /* cookie */
-	totlen += 8; /* verifier */
-	totlen += 4; /* dircount */
-	totlen += 4; /* maxcount */
+    /* Check for XDR_ALIGN overflow before calculating total length */
+    if (count > UINT32_MAX - (XDR_UNIT - 1)) {
+        errno = EINVAL;
+        return -1;
+    }
 
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_READDIRPLUS);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += sizeof(struct write_call_footer);
+    totlen += XDR_ALIGN(count);
 
-	/* File handle */
-	 *(uint32_t *)pt = htonl(dpt->fhlen);
-	pt += 4;
-	memcpy(pt, dpt->fh, dpt->fhlen);
-	pt += ALIGN(dpt->fhlen, 4);
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
 
-	/* cookie */
-	*(uint64_t *)pt = dpt->cookie;
-	pt += 8;
+    memset(buf, 0x00, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_WRITE);
+    pt = buf + sizeof(struct rpc_call_hdr);
 
-	/* verifier */
-	*(uint64_t *)pt = dpt->verifier;
-	pt += 8;
+    pt = nfsv3_build_fh(pt, fh);
 
-	/* dircount */
-	*(uint32_t *)pt = htonl(sizeof(buf) - (sizeof(struct entattr)+FHMAXLEN));
-	pt += 4;
+    footer = (struct write_call_footer *)pt;
+    pt += sizeof(struct write_call_footer);
+    footer->offset = htobe64(offset);
+    footer->count = htonl(count);
+    footer->stable = htonl(stability);
+    footer->datalen = htonl(count);
 
-	/* maxcount */
-	*(uint32_t *)pt = htonl(sizeof(buf));
-	pt += 4;
+    memcpy(pt, data, count);
 
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
 
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd, buf, sizeof(buf), xid)) < 0)
+        return -1;
 
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
 
-	print(1, ctx, "Read %lu bytes of data for READDIRPLUS reply\n", n);
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
+    NFS_CHECK_STATUS(ctx, reply);
 
-	memset(ent, 0x00, sizeof(struct dirplusent));
+    /* Parse response if caller wants it */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
 
-	/* Dir attributes */
-	if (value_follows == 1) {
-		pt += sizeof(struct entattr);
-	}
+        /* WCC data: pre_op_attr (skip) + post_op_attr */
+        pt = nfsv3_parse_wcc_data(pt, end, &out->attr, &out->has_attr);
+        if (pt == NULL)
+            goto done;
 
-	verifier = *(uint64_t *)pt;
-	pt += 8;
+        /* count + committed + verf */
+        if (pt + XDR_UNIT + XDR_UNIT + sizeof(uint64_t) > end)
+            goto done;
+        out->count = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        out->committed = xdr_get_u32(pt);
+        pt += XDR_UNIT;
+        /*
+         * Write verifier: OPAQUE 8-byte value (RFC 1813).
+         * WARNING: Do NOT byte-swap - opaque values must be compared as raw bytes.
+         */
+        memcpy(&out->verifier, pt, sizeof(out->verifier));
+    }
 
-	if (dpt->verifier != 0) {
-
-		if (dpt->verifier != verifier) {
-			fprintf(stderr, "** Error: Receieved invalid verifier\n");
-			return -1;
-		}
-	}
-
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* We just return information for the first entry received */
-	if (value_follows == 1) {
-		uint32_t len;
-
-		/* File ID */
-		pt += 8;
-
-		/* Here comes the name */
-		len = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		if (len > (sizeof(ent->name)-1)) {
-			fprintf(stderr, "** Error: Name (%u bytes) exceeds buffer size (%lu)\n", 
-				len, sizeof(ent->name));
-			return -1;
-		}
-
-		memcpy(ent->name, pt, len);
-		pt += ALIGN(len, 4);
-
-		cookie = *(uint64_t *)pt;
-		pt += 8;
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		
-		/* Name attributes */
-		if (value_follows == 1) {
-			memcpy(&ent->attr, pt, sizeof(struct entattr));
-			pt += sizeof(struct entattr);
-		}
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		/* File handle */
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		if (value_follows == 1) {
-			len = ntohl(*(uint32_t *)pt);
-			pt += 4;
-	
-			if (len > (sizeof(ent->fh)-1)) {
-				fprintf(stderr, "** Error: FH (%u bytes) exceeds buffer size (%lu)\n",
-					len, sizeof(ent->fh));
-				return -1;
-			}
-
-			memcpy(ent->fh, pt, len);
-			pt += ALIGN(len, 4);
-			ent->fhlen = len;
-		}
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		dpt->entcount++;
-	}
-
-	/* We do not buffer subsequent entries
-	 * If the entry fetched above was the last one, no more
-	 * value should follow and the EOF marker should be read */
-	if (value_follows == 0) {
-		uint32_t eof;
-
-		eof = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		/* We reached the last entry */
-		if (eof == 1)
-			dpt->eof = 1;
-	}
-
-	/* Save the cookie and verifier for the next call */
-	dpt->verifier = verifier;
-	dpt->cookie = cookie;
-	return dpt->eof;
+done:
+    return 0;
 }
-
 
 /*
- * Find ".." using READDIRPLUS by reading entries one by one
- * in directory represented by file handle.
- * Returns the length of the filehandle for .. on success (which might be zero!)
- * and -1 on error.
- * The fiel handle is saved to the memory pointed to by fhsave which must hold at 
- * least FHMAXLEN bytes.
+ * COMMIT - Commit cached data to stable storage.
+ *
+ * RFC 1813 Section 3.3.21 - NFSPROC3_COMMIT (procedure 21)
+ *
+ * Forces or flushes data previously written with UNSTABLE to stable
+ * storage. The offset and count specify the range to commit; offset=0
+ * and count=0 means commit the entire file.
+ *
+ * Returns a write verifier that changes if the server reboots. If the
+ * verifier differs from what was returned by WRITE, the data may have
+ * been lost and needs to be rewritten.
+ *
+ * Returns 0 on success, -1 on error.
  */
 int
-nfsv3_readdirplus_dotdot(struct nfsctx *ctx, uint8_t *fhandle, uint32_t fhlen, uint8_t *fhsave)
+nfsv3_commit(struct nfsctx *ctx, const struct nfs_fh *fh,
+    uint64_t offset, uint32_t count, struct nfs_commit_res *out)
 {
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-	uint8_t buf[IOBUFSIZE];
+    uint8_t buf[RPC_BUFSIZE_LARGE];
+    struct rpc_call_hdr *call;
+    struct rpc_nfsreply_hdr *reply;
+    uint8_t *pt, *end;
+    size_t totlen;
+    ssize_t n;
+    uint32_t xid;
 
-	uint32_t value_follows;
-	size_t totlen;
-	ssize_t n;
-	uint8_t *pt;
-	uint32_t xid;
-	uint32_t eof;
+    if (out != NULL)
+        memset(out, 0, sizeof(*out));
 
-	uint64_t cookie;
-	uint64_t verifier;
+    xid = rand();
+    print(V_TRACE, ctx, "NFS3 COMMIT XID 0x%08x offset=%lu count=%u\n",
+        xid, (unsigned long)offset, count);
 
-	verifier = 0;
-	cookie = 0;
+    /* Build request: RPC header + fh + offset(8) + count(4) */
+    totlen = sizeof(struct rpc_call_hdr);
+    totlen += XDR_VARLEN(fh->len);
+    totlen += 8 + XDR_UNIT; /* offset + count */
 
-call_again:
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
+    if (totlen > sizeof(buf)) {
+        errno = ENOBUFS;
+        return -1;
+    }
 
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(fhlen, 4);
-	totlen += 8; /* cookie */
-	totlen += 8; /* verifier */
-	totlen += 4; /* dircount */
-	totlen += 4; /* maxcount */
+    memset(buf, 0, totlen);
+    call = (struct rpc_call_hdr *)buf;
+    RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, NFSV3_PROC_COMMIT);
+    pt = buf + sizeof(struct rpc_call_hdr);
 
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_READDIRPLUS);
-	pt = buf + sizeof(struct rpc_call_hdr);
+    /* File handle */
+    pt = nfsv3_build_fh(pt, fh);
 
-	/* File handle */
-	 *(uint32_t *)pt = htonl(fhlen);
-	pt += 4;
-	memcpy(pt, fhandle, fhlen);
-	pt += ALIGN(fhlen, 4);
+    /* offset (64-bit) */
+    pt = xdr_build_u64(pt, offset);
 
-	/* cookie */
-	*(uint64_t *)pt = cookie;
-	pt += 8;
+    /* count (32-bit) */
+    pt = xdr_build_u32(pt, count);
+    (void)pt;
 
-	/* verifier */
-	*(uint64_t *)pt = verifier;
-	pt += 8;
+    if (udp_write(ctx, ctx->server.ip, ctx->ports.nfsd, buf, totlen) < 0)
+        return -1;
 
-	/* dircount */
-	*(uint32_t *)pt = htonl(sizeof(buf) - (sizeof(struct entattr)+FHMAXLEN));
-	pt += 4;
+    memset(buf, 0, sizeof(buf));
+    if ((n = rpc_recv_xid(ctx, ctx->server.ip, ctx->ports.nfsd,
+             buf, sizeof(buf), xid)) < 0)
+        return -1;
 
-	/* maxcount */
-	*(uint32_t *)pt = htonl(sizeof(buf));
-	pt += 4;
+    reply = (struct rpc_nfsreply_hdr *)buf;
+    RPC_CHECK_REPLY(ctx, reply, n);
 
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
+    NFS_CHECK_STATUS(ctx, reply);
 
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
+    /* Parse response if caller wants it */
+    if (out != NULL) {
+        pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        end = buf + n;
 
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
+        /* WCC data: pre_op_attr (skip) + post_op_attr */
+        pt = nfsv3_parse_wcc_data(pt, end, &out->attr, &out->has_attr);
+        if (pt == NULL)
+            goto done;
 
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
+        /*
+         * Write verifier: OPAQUE 8-byte value (RFC 1813).
+         * WARNING: Do NOT byte-swap - opaque values must be compared as raw bytes.
+         */
+        if (pt + 8 > end)
+            goto done;
+        memcpy(&out->verifier, pt, sizeof(out->verifier));
+    }
 
-	/* Dir attributes */
-	if (value_follows == 1) {
-		pt += sizeof(struct entattr);
-	}
-
-	/* Verifier */
-	if (verifier != 0) {
-		if (verifier != *(uint64_t *)pt) {
-			fprintf(stderr, "** Error: Receieved invalid verifier\n");
-			return -1;
-		}
-	}
-	else {
-		verifier = *(uint64_t *)pt;
-	}
-	pt += 8;
-
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* Loop through all entries received */
-	while (value_follows == 1) {
-		uint32_t dotdot;
-		uint32_t len;
-		uint32_t fhlen;
-
-		/* File ID */
-		pt += 8;
-
-		/* Here comes the name */
-		len = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		/* Found .. */
-		dotdot = 0;
-		fhlen = 0;
-		if (len == 2) {
-			if (memcmp(pt, "..", 2) == 0)
-				dotdot = 1;
-		}
-		pt += ALIGN(len, 4);
-
-		cookie = *(uint64_t *)pt;
-		pt += 8;
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		
-		/* Name attributes */
-		if (value_follows == 1) {
-			pt += sizeof(struct entattr);
-		}
-
-		/* File handle */
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		if (value_follows == 1) {
-			len = ntohl(*(uint32_t *)pt);
-			fhlen = len;
-			pt += 4;
-	
-			if (len > (FHMAXLEN)) {
-				fprintf(stderr, "** Error: FH (%u bytes) exceeds buffer size (FHMAXLEN)\n",
-					len);
-				return -1;
-			}
-
-			if (fhsave != NULL)
-				memcpy(fhsave, pt, len);
-
-			pt += ALIGN(len, 4);
-		}
-
-		/* Found it, just return */
-		if (dotdot != 0) {
-			return fhlen;
-		}
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-	}
-
-	eof = htonl(*(uint32_t *)pt);
-	if (eof == 0)
-		goto call_again;
-
-	/* ".." was not found */
-	return -1;
+done:
+    return 0;
 }
 
-
-/*
- * Do READDIRPLUS Call
- */
-int
-nfsv3_readdirplus(struct nfsctx *ctx, uint32_t opts, uint8_t *fhandle, uint32_t fhlen)
-{
-	struct rpc_call_hdr *call;
-	struct rpc_nfsreply_hdr *reply;
-
-	uint8_t buf[IOBUFSIZE*10];
-	uint32_t value_follows;
-	size_t totlen;
-	ssize_t n;
-	uint8_t *pt;
-	uint32_t eof;
-	uint64_t cookie;
-	uint64_t verifier;
-	uint64_t calls;
-	uint64_t tot;
-	uint64_t ents;
-	uint32_t xid;
-
-	struct readdirplus_call_footer {
-		uint64_t cookie;
-		uint64_t verifier;
-		uint32_t dircount;
-		uint32_t maxcount;
-	} __attribute__((packed)) *footer;
-
-	verifier = 0;
-	cookie = 0;
-	calls = 0;
-	tot = 0;
-	ents = 0;
-
-call_again:
-	xid = rand();
-	print(1, ctx, "Generated XID 0x%08x\n", xid);
-	calls++;
-
-	totlen = sizeof(struct rpc_call_hdr);
-	totlen += 4 + ALIGN(fhlen, 4);
-	totlen += sizeof(struct readdirplus_call_footer);
-
-	if (totlen > sizeof(buf)) {
-		fprintf(stderr, " ** Error: Total length exceeds buffer\n");
-		return -1;
-	}
-	memset(buf, 0x00, sizeof(buf));
-	call = (struct rpc_call_hdr *)buf;
-	RPC_INIT_REQ(call, RPC_PROGRAM_NFS, 3, RPC_NFSV3_PROCEDURE_READDIRPLUS);
-	pt = buf + sizeof(struct rpc_call_hdr);
-
-	/* File handle */
-	*(uint32_t *)pt = htonl(fhlen);
-	pt += 4;
-	memcpy(pt, fhandle, fhlen);
-	pt += ALIGN(fhlen, 4);
-
-	print(1, ctx, "FH len: %u\n", fhlen);
-
-	footer = (struct readdirplus_call_footer *)pt;
-	pt += sizeof(struct readdirplus_call_footer);
-	footer->cookie = cookie;
-	footer->verifier = verifier;
-	footer->dircount = htonl(IOBUFSIZE/2);
-	footer->maxcount = htonl(IOBUFSIZE);
-
-	if (udp_write(ctx, ctx->ip, ctx->port_nfsd, buf, totlen) < 0) {
-		return -1;
-	}
-
-	memset(buf, 0x00, sizeof(buf));
-	if ( (n = udp_read(ctx, ctx->ip, ctx->port_nfsd, buf, sizeof(buf))) < 0) {
-		return -1;
-	}
-	tot += n;
-	reply = (struct rpc_nfsreply_hdr *)buf;
-	RPC_CHECK_REPLY(reply, n);
-	NFS_CHECK_REPLY(ntohl(reply->status));
-	pt = buf + sizeof(struct rpc_nfsreply_hdr);
-
-	print(1, ctx, "Read %lu bytes of data for READDIRPLUS reply\n", n);
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	/* Dir attributes */
-	if (value_follows == 1) {
-		pt += sizeof(struct entattr);
-	}
-
-	verifier = *(uint64_t *)pt;
-	pt += 8;
-
-	value_follows = ntohl(*(uint32_t *)pt);
-	pt += 4;
-
-	while (value_follows == 1) {
-	//	uint64_t fid;
-		uint32_t len;
-		char name[1024];
-
-		ents++;
-
-	//	fid = be64toh(*(uint64_t *)pt);
-		pt += 8;
-
-		len = ntohl(*(uint32_t *)pt);
-		pt += 4;
-		
-		memset(name, 0x00, sizeof(name));
-		memcpy(name, pt, len > (sizeof(name)-1) ? (sizeof(name)-1) : len);
-		pt += ALIGN(len, 4);
-		
-		cookie = *(uint64_t *)pt;
-		pt += 8;
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		/* Name attributes */
-		if (value_follows == 1) {
-			char str[4096];
-			struct entattr *attr;
-
-			attr = (struct entattr *)pt;
-			if (nfsv3_attrstr(ctx, attr, opts, name, str, sizeof(str)) != NULL) {
-				printf("%s ", str);
-			}
-
-			pt += sizeof(struct entattr);
-		}
-
-		/* Sometimes there are no attributes associated with names */
-		else {
-			struct entattr attr;
-			char str[4096];
-
-			memset(&attr, 0x00, sizeof(struct entattr ));
-			if (nfsv3_attrstr(ctx, &attr, opts, name, str, sizeof(str)) != NULL) {
-				printf("%s ", str);
-			}
-		}
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-
-		/* File handle */
-		if (value_follows == 1) {
-			len = ntohl(*(uint32_t *)pt);
-			pt += 4;
-			printf("FH:");
-			HEXDUMP(pt, len);
-			pt += ALIGN(len, 4);
-		}
-		else {
-			printf("\n");
-		}
-
-		if (pt > (buf + sizeof(buf))) {
-			fprintf(stderr, "** Error: Buffer size exceeded\n");
-			return -1;
-		}
-
-		value_follows = ntohl(*(uint32_t *)pt);
-		pt += 4;
-	}
-
-	/* EOF marker */
-	eof = htonl(*(uint32_t *)pt);
-
-	if (eof == 0) {
-		print(1, ctx, "EOF != 1, running call %lu\n", calls+1);
-		goto call_again;
-	}
-
-	print(0, ctx, "Read %lu entries, %lu bytes, in %lu calls\n", 
-		ents, tot, calls);
-	
-	return 0;
-}
-
+/* NFSv3 operations table */
+struct nfs_ops nfsv3_unified_ops = {
+    .getattr = nfsv3_getattr_impl,
+    .setattr = nfsv3_setattr_impl,
+    .lookup = nfsv3_lookup_impl,
+    .readlink = nfsv3_readlink_impl,
+    .read = nfsv3_read_impl,
+    .write = nfsv3_write_impl,
+    .create = nfsv3_create_impl,
+    .remove = nfsv3_remove_impl,
+    .rename = nfsv3_rename_impl,
+    .link = nfsv3_link_impl,
+    .symlink = nfsv3_symlink_impl,
+    .mkdir = nfsv3_mkdir_impl,
+    .rmdir = nfsv3_rmdir_impl,
+    .readdir = nfsv3_readdir_impl,
+    .readdirplus = nfsv3_readdirplus_impl,
+    .mknod = nfsv3_mknod_impl,
+    .statfs = nfsv3_fsstat_impl,
+    .fsinfo = nfsv3_fsinfo_impl,
+    .access = nfsv3_access_impl,
+    .pathconf = nfsv3_pathconf_impl,
+};

@@ -1,6 +1,6 @@
-
 /*
- * Copyright (C)  2023-2024 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2023-2026 Claes M Nyberg <cmn@signedness.org>
+ * Copyright (C)  2025-2026 John Cartwright <johnc@grok.org.uk>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -13,10 +13,11 @@
  *    documentation and/or other materials provided with the distribution.
  * 3. All advertising materials mentioning features or use of this software
  *    must display the following acknowledgement:
- *      This product includes software developed by Claes M Nyberg.
- * 4. The name Claes M Nyberg may not be used to endorse or promote
- *    products derived from this software without specific prior written
- *    permission.
+ *      This product includes software developed by Claes M Nyberg and
+ *      John Cartwright.
+ * 4. The names Claes M Nyberg and John Cartwright may not be used to endorse
+ *    or promote products derived from this software without specific prior
+ *    written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY
  * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -30,29 +31,44 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+
+/*
+ * str.h - String utilities
+ *
+ * Formatting functions for timestamps, durations, sizes, permissions,
+ * file handles (hex), and other string conversions.
+ */
+
 #ifndef STR_H
 #define STR_H
 
 #include <stdint.h>
 #include <time.h>
 
-#define HEXDUMP(_pt, _len)           \
-{                                     \
-    int i = 0;                        \
-    for (;i<(_len); i++)              \
-        printf("%02x", (_pt)[i]);     \
-    printf("\n");                     \
-}
+#define HEXDUMP(_pt, _len)              \
+    {                                   \
+        size_t _i, _n = (size_t)(_len); \
+        for (_i = 0; _i < _n; _i++)     \
+            printf("%02x", (_pt)[_i]);  \
+        printf("\n");                   \
+    }
 
+/* Recommended buffer size for str_hsize */
+#define STR_HSIZE_BUFLEN 24
+
+/* Convenience macro to avoid redundant sizeof() */
+#define STR_HSIZE(val, buf) str_hsize(val, buf, sizeof(buf))
 
 /* str.c */
-extern char *str_timestamp(char *, size_t);
 extern char *str_hhmmss(time_t, char *, size_t);
+extern char *str_duration(time_t, char *, size_t);
 extern char *str_time(char *, size_t, time_t);
-extern char *str_hex(uint8_t *, size_t, char *, size_t);
-extern char *str_printable(uint8_t *, size_t, char *, size_t);
-extern unsigned int str_to_argv(char *, char **, unsigned int);
+extern char *str_time_ls(char *, size_t, time_t);
+extern char *str_hex(const uint8_t *, size_t, char *, size_t);
+extern char *str_printable(const uint8_t *, size_t, char *, size_t);
+extern size_t str_to_argv(char *, char **, size_t);
 extern int str_hex2bin(const char *, uint8_t *, size_t);
-extern const char *str_hsize(size_t);
+extern char *str_hsize(size_t, char *, size_t);
+extern int str_to_int(const char *, int *, int, int);
 
 #endif /* STR_H */
