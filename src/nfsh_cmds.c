@@ -601,8 +601,6 @@ cmd_help(struct nfsctx *ctx, int argc, char **argv)
         /* Fall through to show available commands */
     }
 
-    printf("NFS v3 CLI v%s, by Claes M Nyberg <cmn@signedness.org>, Aug 2023\n",
-        NFSCLI_VERSION);
     printf("Available commands:\n");
     for (i = 0; cmds[i].name != NULL; i++) {
         w = printf("%s ", cmds[i].name);
